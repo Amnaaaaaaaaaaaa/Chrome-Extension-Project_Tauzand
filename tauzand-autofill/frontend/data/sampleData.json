@@ -1,0 +1,25 @@
+{
+  "sampleCandidateProfile": {
+    "id": "demo-user-1",
+    "fullName": "Amna Malik",
+    "firstName": "Amna",
+    "lastName": "Malik",
+    "email": "amna@example.com",
+    "phone": "+92 3259511659",
+    "linkedinUrl": "https://linkedin.com/in/amnamalik"
+  },
+  "sampleFillResult": {
+    "success": true,
+    "platform": "google_forms",
+    "fields_detected": 4,
+    "filled": [
+      { "label": "First Name", "profile_key": "first_name", "confidence": 0.94 },
+      { "label": "Email", "profile_key": "email", "confidence": 0.97 }
+    ],
+    "skipped": [
+      { "label": "Cover Letter", "reason": "low_confidence_or_unmapped", "confidence": 0.2 }
+    ],
+    "events": [],
+    "duration_ms": 1850
+  }
+}
