@@ -4,7 +4,11 @@ nothing is hardcoded inside the actual logic files. Values are pulled from
 environment variables with sane local-dev defaults.
 """
 import os
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore[import]
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 load_dotenv()
 
@@ -18,11 +22,31 @@ class Config:
 
     # --- Selenium / browser ---
     SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "false").lower() == "true"
-    SELENIUM_IMPLICIT_WAIT_SECONDS = float(os.getenv("SELENIUM_IMPLICIT_WAIT_SECONDS", "2"))
+    # Was 2s. This is the main knob behind the "filling doesn't start for
+    # 50s-1min" complaint: every find_elements() call that legitimately
+    # finds nothing (e.g. checking radio_selector against a plain text
+    # question block) still retries for up to this long before Selenium
+    # gives up and returns an empty list. scan_form() and
+    # scan_and_fill_choice_fields() each run 2-3 such existence-checking
+    # selectors per question block, so on a ~15-question form this was
+    # silently adding up to a minute of pure waiting before the first
+    # character was ever typed. By the time these per-block checks run, the
+    # form container has already been explicitly waited for
+    # (FORM_SCAN_TIMEOUT_SECONDS) and given a DOM_STABILIZE_WAIT_SECONDS
+    # pause, so the DOM is already settled — a long implicit wait here isn't
+    # buying any extra reliability, just extra time. Lower this further via
+    # the env var if 10-20s is still too slow on a fast connection; raise it
+    # back up only if you start seeing false "not found" results on a slow
+    # or heavily JS-animated form.
+    SELENIUM_IMPLICIT_WAIT_SECONDS = float(os.getenv("SELENIUM_IMPLICIT_WAIT_SECONDS", "0.3"))
     SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS = float(os.getenv("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "20"))
     FIELD_TYPE_DELAY_MS = (int(os.getenv("FIELD_TYPE_DELAY_MIN_MS", "40")),
                             int(os.getenv("FIELD_TYPE_DELAY_MAX_MS", "120")))
-    DOM_STABILIZE_WAIT_SECONDS = float(os.getenv("DOM_STABILIZE_WAIT_SECONDS", "1.5"))
+    # Was 1.5s, and is paid twice per run (once after scan_form, once before
+    # scan_and_fill_choice_fields) — trimmed since the explicit
+    # WebDriverWait on the form container already guarantees the container
+    # itself is there; this pause is only for late-rendering fields inside it.
+    DOM_STABILIZE_WAIT_SECONDS = float(os.getenv("DOM_STABILIZE_WAIT_SECONDS", "0.8"))
     FORM_SCAN_TIMEOUT_SECONDS = float(os.getenv("FORM_SCAN_TIMEOUT_SECONDS", "15"))
 
     # --- CAPTCHA / human-intervention detection ---
