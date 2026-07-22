@@ -23,61 +23,16 @@ try:
     from selenium.common.exceptions import (  # type: ignore[import]
         TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
     )
-except Exception:  # pragma: no cover - allow tooling/linting environments without selenium installed
-    # Provide light-weight fallbacks so static analysis / editors don't error
+except ImportError:
     webdriver = None
-
-    class Options:  # type: ignore
-        pass
-
-    class By:  # type: ignore
-        ID = "id"
-        XPATH = "xpath"
-        CSS_SELECTOR = "css selector"
-
-    class WebDriverWait:  # type: ignore
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def until(self, *args, **kwargs):
-            raise RuntimeError("selenium not available")
-
-    class EC:  # type: ignore
-        @staticmethod
-        def presence_of_element_located(*args, **kwargs):
-            return None
-    # Provide exception names so code referencing them doesn't break when selenium
-    # isn't installed (e.g. in static analysis / linting environments).
+    Options = None
+    By = None
+    WebDriverWait = None
+    EC = None
     TimeoutException = Exception
     NoSuchElementException = Exception
     WebDriverException = Exception
     StaleElementReferenceException = Exception
-    # Minimal exception stubs so static analysis and runtime fallback work
-    class TimeoutException(Exception):
-        pass
-
-    class NoSuchElementException(Exception):
-        pass
-
-    class WebDriverException(Exception):
-        pass
-
-    class StaleElementReferenceException(Exception):
-        pass
-
-    # Lightweight fallback exception classes so imports like
-    # `from selenium.common.exceptions import TimeoutException` still work
-    class TimeoutException(Exception):
-        pass
-
-    class NoSuchElementException(Exception):
-        pass
-
-    class WebDriverException(Exception):
-        pass
-
-    class StaleElementReferenceException(Exception):
-        pass
 
 from config import Config
 from services import platform_configs
@@ -439,21 +394,39 @@ def scan_and_fill_choice_fields(driver, platform_key: str, profile: dict) -> dic
                 # except block.
                 option_pairs = list(zip((_option_text_for(el) for el in checkbox_options), checkbox_options))
                 selected_any = False
+                # Track option TEXT (not element references, since those go
+                # stale/get replaced on retry) that has already been clicked.
+                #
+                # Bug fixed after checkpoint testing: without this, a later
+                # value_item could fuzzy-match the SAME checkbox an earlier
+                # value_item already selected — e.g. "TypeScript" scoring high
+                # enough against the "JavaScript" option (they share the
+                # substring "Script") to be picked when the real "TypeScript"
+                # option wasn't scored high enough or came second. Since a
+                # checkbox click is a toggle, re-clicking an already-selected
+                # option UNCHECKS it — so "JavaScript" would get selected
+                # first, then silently deselected later in the same loop,
+                # ending with every skill checked except the first one.
+                already_selected_texts = set()
                 for value_item in profile_value:
-                    match = _select_matching_option(option_pairs, value_item)
+                    available_pairs = [pair for pair in option_pairs if pair[0] not in already_selected_texts]
+                    match = _select_matching_option(available_pairs, value_item)
                     if not match:
                         continue
                     try:
                         match[1].click()
+                        already_selected_texts.add(match[0])
                         selected_any = True
                         filled.append({"label": question_title, "profile_key": profile_key, "selected_option": match[0], "confidence": round(confidence, 2)})
                     except StaleElementReferenceException:
                         fresh_checkboxes = [el for el in question_block.find_elements(By.CSS_SELECTOR, checkbox_selector) if el.is_displayed()]
                         fresh_pairs = list(zip((_option_text_for(el) for el in fresh_checkboxes), fresh_checkboxes))
-                        retry = _select_matching_option(fresh_pairs, value_item)
+                        available_fresh_pairs = [pair for pair in fresh_pairs if pair[0] not in already_selected_texts]
+                        retry = _select_matching_option(available_fresh_pairs, value_item)
                         if retry:
                             try:
                                 retry[1].click()
+                                already_selected_texts.add(retry[0])
                                 selected_any = True
                                 filled.append({"label": question_title, "profile_key": profile_key, "selected_option": retry[0], "confidence": round(confidence, 2)})
                             except StaleElementReferenceException:
