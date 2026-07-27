@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Tauzand Autofill",
+  "version": "0.1.0",
+  "description": "Automatically fills job application forms using your saved Tauzand profile.",
+
+  "permissions": ["activeTab", "scripting", "storage", "debugger"],
+
+  "host_permissions": [
+    "http://localhost:5000/*",
+    "https://*.myworkday.com/*",
+    "https://*.greenhouse.io/*",
+    "https://*.ashbyhq.com/*",
+    "https://docs.google.com/forms/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.myworkday.com/*",
+        "https://*.greenhouse.io/*",
+        "https://*.ashbyhq.com/*",
+        "https://docs.google.com/forms/*"
+      ],
+      "js": ["platform_selectors.js", "matcher.js", "content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Tauzand Autofill"
+  }
+}
