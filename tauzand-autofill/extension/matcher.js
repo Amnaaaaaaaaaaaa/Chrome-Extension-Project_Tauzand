@@ -16,11 +16,23 @@ const FIELD_LABEL_HINTS = {
   phone: ["phone", "mobile", "contact number"],
   address: ["home address", "street address", "mailing address", "address", "street"],
   city: ["city"],
+  current_location: ["current location", "location"],
   linkedin_url: ["linkedin"],
   portfolio_url: ["portfolio", "website"],
   referral_source: ["how did you hear", "referral source", "how did you find", "how did you learn about"],
   preferred_work_location: ["preferred work location", "work location", "work arrangement", "remote or on-site"],
   skills: ["which skills", "select your skills", "skills do you have", "technical skills"],
+  pronouns: ["pronouns", "preferred pronouns"],
+  work_authorized_us: ["authorized to work", "work authorization", "legally authorized"],
+  visa_sponsorship_status: ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
+  willing_to_relocate: ["willing to relocate", "able to relocate", "relocate for this role"],
+  github_url: ["github"],
+  school: ["school", "university", "college"],
+  graduation_date: ["graduation date", "expected graduation", "when do you expect to graduate"],
+  degree_type: ["degree type", "degree you are", "what degree"],
+  prior_internships_count: ["prior internships", "how many internships", "number of internships"],
+  gender: ["gender identity", "gender"],
+  race: ["race", "ethnicity", "race & ethnicity", "race and ethnicity"],
 };
 
 const LEGAL_CHECKBOX_KEYWORDS = [

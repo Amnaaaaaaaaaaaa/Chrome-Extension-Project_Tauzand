@@ -12,27 +12,15 @@ import re
 import time
 import uuid
 from difflib import SequenceMatcher
-from typing import Any
 
-try:
-    from selenium import webdriver  # type: ignore[import]
-    from selenium.webdriver.chrome.options import Options  # type: ignore[import]
-    from selenium.webdriver.common.by import By  # type: ignore[import]
-    from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[import]
-    from selenium.webdriver.support import expected_conditions as EC  # type: ignore[import]
-    from selenium.common.exceptions import (  # type: ignore[import]
-        TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
-    )
-except ImportError:
-    webdriver = None
-    Options = None
-    By = None
-    WebDriverWait = None
-    EC = None
-    TimeoutException = Exception
-    NoSuchElementException = Exception
-    WebDriverException = Exception
-    StaleElementReferenceException = Exception
+from selenium import webdriver  # type: ignore[import]
+from selenium.webdriver.chrome.options import Options  # type: ignore[import]
+from selenium.webdriver.common.by import By  # type: ignore[import]
+from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[import]
+from selenium.webdriver.support import expected_conditions as EC  # type: ignore[import]
+from selenium.common.exceptions import (  # type: ignore[import]
+    TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
+)
 
 from config import Config
 from services import platform_configs
@@ -60,15 +48,27 @@ FIELD_LABEL_HINTS = {
     "phone": ["phone", "mobile", "contact number"],
     "address": ["home address", "street address", "mailing address", "address", "street"],
     "city": ["city"],
+    "current_location": ["current location", "location"],
     "linkedin_url": ["linkedin"],
     "portfolio_url": ["portfolio", "website"],
     "referral_source": ["how did you hear", "referral source", "how did you find", "how did you learn about"],
     "preferred_work_location": ["preferred work location", "work location", "work arrangement", "remote or on-site"],
     "skills": ["which skills", "select your skills", "skills do you have", "technical skills"],
+    "pronouns": ["pronouns", "preferred pronouns"],
+    "work_authorized_us": ["authorized to work", "work authorization", "legally authorized"],
+    "visa_sponsorship_status": ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
+    "willing_to_relocate": ["willing to relocate", "able to relocate", "relocate for this role"],
+    "github_url": ["github"],
+    "school": ["school", "university", "college"],
+    "graduation_date": ["graduation date", "expected graduation", "when do you expect to graduate"],
+    "degree_type": ["degree type", "degree you are", "what degree"],
+    "prior_internships_count": ["prior internships", "how many internships", "number of internships"],
+    "gender": ["gender identity", "gender"],
+    "race": ["race", "ethnicity", "race & ethnicity", "race and ethnicity"],
 }
 
 
-def build_driver() -> Any:
+def build_driver() -> webdriver.Chrome:
     options = Options()
     if Config.SELENIUM_HEADLESS:
         options.add_argument("--headless=new")
@@ -505,7 +505,7 @@ def fill_fields(fields: list[dict], profile: dict, min_confidence: float = 0.75)
 # a strong reference here is what makes the window stay open for manual
 # review/submission as intended.
 # TC: O(1) average insert/lookup/delete per driver_id | SC: O(n) for n open sessions
-_open_drivers: dict[str, Any] = {}
+_open_drivers: dict[str, webdriver.Chrome] = {}
 
 
 def close_driver(driver_id: str) -> bool:
