@@ -12,15 +12,27 @@ import re
 import time
 import uuid
 from difflib import SequenceMatcher
+from typing import Any, Dict
 
-from selenium import webdriver  # type: ignore[reportMissingImports]
-from selenium.webdriver.chrome.options import Options  # type: ignore[reportMissingImports]
-from selenium.webdriver.common.by import By  # type: ignore[reportMissingImports]
-from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[reportMissingImports]
-from selenium.webdriver.support import expected_conditions as EC  # type: ignore[reportMissingImports]
-from selenium.common.exceptions import (  # type: ignore[reportMissingImports]
-    TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
-)
+try:
+    from selenium import webdriver  # type: ignore[import]
+    from selenium.webdriver.chrome.options import Options  # type: ignore[import]
+    from selenium.webdriver.common.by import By  # type: ignore[import]
+    from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[import]
+    from selenium.webdriver.support import expected_conditions as EC  # type: ignore[import]
+    from selenium.common.exceptions import (  # type: ignore[import]
+        TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
+    )
+except ImportError:
+    webdriver = None
+    Options = None
+    By = None
+    WebDriverWait = None
+    EC = None
+    TimeoutException = Exception
+    NoSuchElementException = Exception
+    WebDriverException = Exception
+    StaleElementReferenceException = Exception
 
 from config import Config
 from services import platform_configs
@@ -48,35 +60,15 @@ FIELD_LABEL_HINTS = {
     "phone": ["phone", "mobile", "contact number"],
     "address": ["home address", "street address", "mailing address", "address", "street"],
     "city": ["city"],
-    "current_location": ["current location", "location"],
-    "requires_visa_sponsorship": ["now or in the future require", "will you in the future require immigration sponsorship", "require immigration sponsorship"],
-    "currently_enrolled": ["will return to the program upon completion", "currently enrolled in a university"],
-    "veteran_status": ["veteran status", "protected veteran"],
-    "disability_status": ["disability status", "do you have a disability"],
-    "current_company": ["current company", "current employer", "where do you currently work"],
-    "eu_efta_citizen": ["citizen of a country in the eu", "eu/efta", "european union"],
-    "languages": ["languages", "which languages", "language proficiency", "language skill"],
-    "date_of_birth": ["date of birth", "birth date", "birthday", "dob"],
     "linkedin_url": ["linkedin"],
     "portfolio_url": ["portfolio", "website"],
     "referral_source": ["how did you hear", "how you heard", "referral source", "how did you find", "how did you learn about"],
     "preferred_work_location": ["preferred work location", "work location", "work arrangement", "remote or on-site"],
     "skills": ["which skills", "select your skills", "skills do you have", "technical skills"],
-    "pronouns": ["pronouns", "preferred pronouns"],
-    "work_authorized_us": ["authorized to work", "work authorization", "legally authorized"],
-    "visa_sponsorship_status": ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
-    "willing_to_relocate": ["willing to relocate", "able to relocate", "relocate for this role"],
-    "github_url": ["github"],
-    "school": ["school", "university", "college"],
-    "graduation_date": ["expect to graduate or complete your program", "intended graduation year", "graduation date", "expected graduation", "when do you expect to graduate"],
-    "degree_type": ["what degree are you currently pursuing", "degree type", "degree you are", "what degree"],
-    "prior_internships_count": ["prior internships", "how many internships", "number of internships"],
-    "gender": ["gender identity", "gender"],
-    "race": ["race", "ethnicity", "race & ethnicity", "race and ethnicity"],
 }
 
 
-def build_driver() -> webdriver.Chrome:
+def build_driver() -> Any:
     options = Options()
     if Config.SELENIUM_HEADLESS:
         options.add_argument("--headless=new")
@@ -513,7 +505,7 @@ def fill_fields(fields: list[dict], profile: dict, min_confidence: float = 0.75)
 # a strong reference here is what makes the window stay open for manual
 # review/submission as intended.
 # TC: O(1) average insert/lookup/delete per driver_id | SC: O(n) for n open sessions
-_open_drivers: dict[str, webdriver.Chrome] = {}
+_open_drivers: Dict[str, Any] = {}
 
 
 def close_driver(driver_id: str) -> bool:
