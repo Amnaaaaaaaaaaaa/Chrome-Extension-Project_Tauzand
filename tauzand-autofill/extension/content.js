@@ -13,6 +13,7 @@ const MIN_TEXT_FIELD_CONFIDENCE = 0.75; // mirrors fill_fields()'s default in fo
 
 // ---------- 1. Platform detection ----------
 const platformKey = detectPlatform(window.location.hostname);
+console.log("[Tauzand Autofill] content script loaded on:", window.location.href, "| detected platform:", platformKey);
 if (platformKey) {
   initAutofill();
 }
@@ -48,8 +49,48 @@ async function initAutofill() {
 }
 
 // ---------- 2. Auto-popup banner (the in-page "click to fill" button) ----------
+let watchdogStarted = false;
+
 function injectBanner(onClick) {
-  if (document.getElementById("tauzand-autofill-banner")) return; // avoid double-inject on SPA route changes
+  createBanner(onClick);
+
+  // Set up the persistent watchdog + MutationObserver exactly once, no
+  // matter how many times injectBanner()/createBanner() itself gets called
+  // afterward by the watchdog re-creating a missing banner — otherwise each
+  // recreation would add ANOTHER interval and observer on top of the
+  // existing ones, stacking up over time instead of just doing the job once.
+  if (watchdogStarted) return;
+  watchdogStarted = true;
+
+  const bodyObserver = new MutationObserver(() => {
+    if (!document.getElementById("tauzand-autofill-banner")) {
+      console.log("[Tauzand Autofill] banner was removed from the page (likely a re-render) — re-injecting");
+      createBanner(onClick);
+    }
+  });
+  bodyObserver.observe(document.documentElement, { childList: true });
+
+  // The banner keeps disappearing entirely from the DOM (confirmed via
+  // console: document.getElementById('tauzand-autofill-banner') returns
+  // null after a few seconds) — Greenhouse's Remix app appears to trigger
+  // repeated internal navigations/reloads after the initial load (visible
+  // in DevTools as "Navigated to ..." markers), each of which can tear down
+  // the whole document context the banner and MutationObserver were
+  // attached to. Rather than chase the exact cause further, this is a
+  // permanent watchdog: check every second, for as long as the page is
+  // open, and recreate the banner from scratch if it's missing. This is
+  // robust regardless of why it disappeared, since it doesn't depend on
+  // catching a specific removal event that a full context teardown could
+  // also wipe out along with everything else.
+  setInterval(() => {
+    if (!document.getElementById("tauzand-autofill-banner")) {
+      createBanner(onClick);
+    }
+  }, 1000);
+}
+
+function createBanner(onClick) {
+  if (document.getElementById("tauzand-autofill-banner")) return; // avoid double-inject
 
   const banner = document.createElement("div");
   banner.id = "tauzand-autofill-banner";
@@ -61,15 +102,19 @@ function injectBanner(onClick) {
     zIndex: "2147483647",
     background: "#1F4E79",
     color: "#ffffff",
-    padding: "10px 16px",
-    borderRadius: "8px",
+    padding: "14px 22px",
+    borderRadius: "10px",
     fontFamily: "system-ui, sans-serif",
-    fontSize: "14px",
+    fontSize: "16px",
+    fontWeight: "600",
     cursor: "pointer",
-    boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
+    boxShadow: "0 4px 14px rgba(0,0,0,0.35)",
+    whiteSpace: "nowrap",
+    lineHeight: "1.4",
   });
   banner.addEventListener("click", onClick);
-  document.body.appendChild(banner);
+  document.documentElement.appendChild(banner);
+  console.log("[Tauzand Autofill] banner appended to page, present in DOM:", !!document.getElementById("tauzand-autofill-banner"));
 }
 
 function showToast(message) {
@@ -107,14 +152,127 @@ function setFieldValue(element, value) {
   element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
+// Same React-safe principle as setFieldValue(), but for <select> elements.
+// A plain `select.value = x` can be silently ignored (or reverted on the
+// next render) if the select is React-controlled, same underlying issue
+// text inputs had.
+function setSelectValue(select, value) {
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+  nativeSetter.call(select, value);
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+// Clicks the associated <label> instead of a bare radio/checkbox <input>
+// directly, when one exists. Confirmed via Ashby's Pronouns question: the
+// visible "_checked_" styling and (very likely) the actual click handler
+// live on the <label for="...">, not the underlying input — clicking the
+// raw input wasn't registering as a real selection even though it's a
+// genuine native radio element.
+function clickOption(element) {
+  // Find the underlying native input, if this option has one, so we can
+  // VERIFY a click actually did something instead of just assuming success
+  // because .click() didn't throw. Confirmed necessary via testing: the
+  // extension was reporting fields as filled while nothing visibly changed
+  // on Ashby's checkbox/radio-group questions — the outer container's
+  // click() was firing without error, but wasn't actually toggling
+  // Ashby's real (React-managed) selected state.
+  const input = element.matches("input") ? element : element.querySelector("input[type='radio'], input[type='checkbox']");
+
+  if (!input) {
+    // No native input to verify against — e.g. the plain Yes/No button
+    // widget, which has no nested input at all and already works fine
+    // with a direct click.
+    element.click();
+    return;
+  }
+
+  const wasChecked = input.checked;
+
+  // Strategy 1: click whatever element was matched (could be the outer
+  // container, a <label>, or the input itself depending on the caller).
+  element.click();
+  if (input.checked !== wasChecked) {
+    console.log("[Tauzand Autofill] clickOption: strategy 1 (direct click) worked");
+    return;
+  }
+
+  // Strategy 2: click the associated <label for="id">.
+  if (input.id) {
+    const label = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+    if (label) {
+      label.click();
+      if (input.checked !== wasChecked) {
+        console.log("[Tauzand Autofill] clickOption: strategy 2 (label click) worked");
+        return;
+      }
+    }
+  }
+
+  // Strategy 3: click the inner wrapping <span> one level in (Ashby wraps
+  // the actual input in a styled <span class="_container_..."> alongside a
+  // decorative circle/checkmark icon — the real click handler may live
+  // there instead of on the outer element).
+  const innerSpan = element.querySelector("span");
+  if (innerSpan) {
+    innerSpan.click();
+    if (input.checked !== wasChecked) {
+      console.log("[Tauzand Autofill] clickOption: strategy 3 (inner span click) worked");
+      return;
+    }
+  }
+
+  // Last resort: directly toggle the native input's checked state via the
+  // React-safe native property setter (same principle as setFieldValue()
+  // for text inputs), then fire both click and change events so React's
+  // controlled-component tracking picks up the change even if nothing
+  // else above found the real handler.
+  console.log("[Tauzand Autofill] clickOption: falling back to direct checked-property toggle");
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "checked").set;
+  nativeSetter.call(input, !wasChecked);
+  input.dispatchEvent(new Event("click", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 function optionTextFor(element) {
-  return (element.getAttribute("aria-label") || element.textContent || element.value || "").trim();
+  const ariaLabel = (element.getAttribute("aria-label") || "").trim();
+  if (ariaLabel) return ariaLabel;
+
+  // Bare <input type="radio"/"checkbox"> elements always have empty
+  // textContent — their visible label (e.g. "He/Him") lives in a separate
+  // <label>, associated either via a matching for="id" or by wrapping the
+  // input directly. Without this, every such radio/checkbox option came
+  // back as an empty string and could never match anything (confirmed via
+  // Ashby's Pronouns question, which uses this exact pattern).
+  if (element.tagName === "INPUT") {
+    if (element.id) {
+      const associatedLabel = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+      if (associatedLabel && associatedLabel.textContent.trim()) return associatedLabel.textContent.trim();
+    }
+    const wrappingLabel = element.closest("label");
+    if (wrappingLabel && wrappingLabel.textContent.trim()) return wrappingLabel.textContent.trim();
+    const parent = element.parentElement;
+    if (parent && parent.textContent.trim()) return parent.textContent.trim();
+    return (element.value || "").trim();
+  }
+
+  return (element.textContent || element.value || "").trim();
 }
 
 // Asks background.js to click a real screen position through the Chrome
 // DevTools Protocol (see background.js's trusted-click service comment for
 // why this is needed instead of a plain element.click()).
 async function trustedClick(element) {
+  // Confirmed via testing: fields further down a long form (Gender,
+  // Veteran Status, Graduation Date) were reliably failing to open while
+  // earlier fields on the same page (Location, Sponsorship) worked fine —
+  // the click coordinates are computed from getBoundingClientRect(), which
+  // is relative to the current scroll position, so an element sitting
+  // below the visible viewport gets clicked at the wrong on-screen spot
+  // (or nothing at all). Scrolling it into view first fixes this.
+  element.scrollIntoView({ block: "center", behavior: "instant" });
+  await sleep(150); // let the scroll (and any resulting layout/animation) settle before measuring position
+
   const rect = element.getBoundingClientRect();
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
@@ -145,9 +303,159 @@ async function typeIntoField(element, value) {
   let typedSoFar = "";
   for (const char of text) {
     typedSoFar += char;
+    // Some autocomplete widgets (confirmed on Lever's plain-JS "Current
+    // Location" field, as opposed to Ashby/Greenhouse's React-based
+    // comboboxes) trigger their search specifically off real keyboard
+    // events, not just a value/input change — dispatching keydown/keyup
+    // alongside the value change covers both cases without affecting
+    // widgets that only needed the input/change events already being sent.
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: char, bubbles: true }));
     setFieldValue(element, typedSoFar);
+    element.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true }));
     const delay = TYPE_DELAY_MIN_MS + Math.random() * (TYPE_DELAY_MAX_MS - TYPE_DELAY_MIN_MS);
     await sleep(delay);
+  }
+}
+
+// For ARIA-combobox autocomplete inputs (role="combobox",
+// aria-autocomplete="list") — confirmed via testing that typing alone
+// isn't enough: Ashby's "Current Location" field resets back to blank if
+// no suggestion is actually selected from the dropdown that opens while
+// typing, the same underlying issue as Google Forms' custom dropdown
+// (a plain typed value never becomes a "real" selection in the widget's
+// own state). Types the value, waits for the suggestion list to render,
+// then clicks the best-matching suggestion (or the first one, if nothing
+// scores well — usually still the most relevant result for a location
+// search). Returns true if a suggestion was clicked, false if none
+// appeared at all (e.g. too short/generic a query, or a network hiccup).
+// For multi-select comboboxes (e.g. "How did you hear" when the profile
+// value is a comma-separated list) — selects one option per value in
+// sequence, reusing a single debugger attachment for the whole field
+// instead of attaching/detaching per value.
+async function fillMultiComboboxField(input, values) {
+  let selectedAny = false;
+  try {
+    for (const value of values) {
+      await trustedClick(input);
+      await sleep(200);
+      await typeIntoField(input, value);
+      await sleep(250);
+
+      let optionElements = [];
+      let previousCount = -1;
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < 1500) {
+        await sleep(150);
+        optionElements = [...document.querySelectorAll("[role='option'], [class*='__option'], .dropdown-results > *")].filter(isVisible);
+        if (optionElements.length > 0 && optionElements.length === previousCount) break;
+        previousCount = optionElements.length;
+      }
+      console.log(`[Tauzand Autofill] multi-combobox suggestions found for "${value}":`, optionElements.map(optionTextFor));
+
+      if (optionElements.length > 0) {
+        const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
+        const match = selectMatchingOption(optionPairs, value);
+        if (match) {
+          await trustedClick(match.element);
+          selectedAny = true;
+          await sleep(CHOICE_CLICK_DELAY_MS);
+        }
+      }
+      // Clear the input text before the next value, in case the menu
+      // stayed open with leftover query text from this attempt.
+      setFieldValue(input, "");
+    }
+    return selectedAny;
+  } catch (err) {
+    console.warn(`[Tauzand Autofill] multi-combobox fill failed:`, err);
+    return selectedAny;
+  }
+}
+
+async function fillComboboxField(input, value) {
+  try {
+    // Confirmed via testing: react-select's menu does not open from
+    // synthetic focus()/typing alone — the same underlying issue as Google
+    // Forms' jsaction-gated dropdown (the widget's open-trigger appears to
+    // require a genuinely trusted mousedown/click, which a content
+    // script's own dispatchEvent() can never produce). A real click via
+    // chrome.debugger fixes it.
+    await trustedClick(input);
+    await sleep(200);
+
+    // Type the full value first — our own fuzzy matching (selectMatchingOption)
+    // below picks the closest option from whatever renders, rather than
+    // needing an exact match. Only if the FULL value renders zero options
+    // at all (react-select's own filter found nothing containing it — e.g.
+    // "Undergraduate/Bachelors" typed against an option that's just
+    // "Bachelors" is not a substring match either way) do we retry once
+    // with a shorter piece of it, just to get *some* options on screen to
+    // fuzzy-match against.
+    async function pollForOptions() {
+      let elements = [];
+      let previousCount = -1;
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < 1500) {
+        await sleep(150);
+        // "[class*='__option']" added alongside role='option' — react-select
+        // (used by both Ashby and Greenhouse's dropdowns) commonly names its
+        // option elements with a BEM-style "{prefix}__option" class.
+        elements = [...document.querySelectorAll("[role='option'], [class*='__option'], .dropdown-results > *")].filter(isVisible);
+        if (elements.length > 0 && elements.length === previousCount) break;
+        previousCount = elements.length;
+      }
+      return elements;
+    }
+
+    await typeIntoField(input, value);
+    await sleep(300);
+    let optionElements = await pollForOptions();
+
+    if (optionElements.length === 0) {
+      const parts = String(value).trim().split(/[\s/]+/).filter(Boolean);
+      const shorterQuery = parts.length > 1 ? parts[parts.length - 1] : null; // e.g. "Bachelors" from "Undergraduate/Bachelors", or "2027" from "June 2027"
+      if (shorterQuery) {
+        console.log(`[Tauzand Autofill] combobox: full value "${value}" showed no options, retrying with "${shorterQuery}"`);
+        setFieldValue(input, "");
+        await sleep(100);
+        await typeIntoField(input, shorterQuery);
+        await sleep(300);
+        optionElements = await pollForOptions();
+      }
+    }
+
+    console.log(`[Tauzand Autofill] combobox suggestions found for "${value}":`, optionElements.map(optionTextFor));
+    if (optionElements.length === 0) return false;
+
+    const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
+    const match = selectMatchingOption(optionPairs, value);
+    const chosen = match || { element: optionElements[0] }; // fall back to the top suggestion if nothing scored well
+    console.log(`[Tauzand Autofill] combobox best match for "${value}":`, optionTextFor(chosen.element));
+
+    await trustedClick(chosen.element);
+    await sleep(300);
+
+    // Verify the selection actually registered — confirmed via testing
+    // that a matched, clicked option can still leave the field empty (the
+    // menu closes but the widget's displayed value never updates). Check
+    // the control's visible "single value" text; if it doesn't show what
+    // was just clicked, try a plain element.click() as a second attempt
+    // before giving up.
+    const control = input.closest(".select__control, [class*='__control']");
+    const displayedValueFromControl = control?.querySelector(".select__single-value, [class*='__single-value']")?.textContent?.trim() || "";
+    const displayedValueFromInput = (input.value || "").trim();
+    const displayedValue = displayedValueFromControl || displayedValueFromInput;
+    console.log(`[Tauzand Autofill] combobox displayed value after click: "${displayedValue}"`);
+    if (!displayedValue) {
+      console.log(`[Tauzand Autofill] selection didn't stick, retrying with a plain click`);
+      chosen.element.click();
+      await sleep(300);
+    }
+
+    return true;
+  } catch (err) {
+    console.warn(`[Tauzand Autofill] combobox fill failed for "${value}":`, err);
+    return false;
   }
 }
 
@@ -295,6 +603,7 @@ async function checkForLoginWall() {
 async function fillTextFields(container, config, profile) {
   const blocks = container.querySelectorAll(config.questionSelector);
   let filledCount = 0;
+  let flaggedForReview = 0;
 
   for (const block of blocks) {
     const titleEl = block.querySelector(config.questionTitleSelector);
@@ -310,18 +619,72 @@ async function fillTextFields(container, config, profile) {
     if (hasChoiceElements) continue;
 
     const textInput = block.querySelector(config.textInputSelector);
-    if (!textInput) continue;
+    if (!textInput) {
+      // Real question, but not a text field we know how to fill (e.g. a
+      // resume/cover-letter upload button). Never auto-filled — uploading a
+      // file on someone's behalf is a much bigger risk than typing text —
+      // but it's still a real field the user needs to handle, so it should
+      // count as "left for review" instead of silently vanishing from every
+      // total, which is what was happening before.
+      const fileInput = block.querySelector("input[type='file']");
+      if (fileInput) flaggedForReview++;
+      continue;
+    }
 
     const { profileKey, score } = bestProfileMatch(questionTitle);
-    if (score < MIN_TEXT_FIELD_CONFIDENCE) continue;
+    if (score < MIN_TEXT_FIELD_CONFIDENCE) {
+      flaggedForReview++; // real text field, but couldn't confidently match it to a profile key
+      continue;
+    }
     const value = profile[profileKey];
-    if (!value) continue;
+    if (!value) {
+      // Matched a profile key correctly, but that field is empty in
+      // Supabase — this used to be silently dropped from both counts,
+      // which is why "4 left for review" was undercounting how many
+      // fields actually needed manual attention.
+      flaggedForReview++;
+      continue;
+    }
 
     showToast(`Typing: ${questionTitle}`);
-    await typeIntoField(textInput, value);
-    filledCount++;
+    // Two signals for "this needs suggestion-selection, not just typing":
+    // the ARIA combobox pattern (Ashby/Greenhouse's react-select widgets),
+    // or a nearby dropdown-suggestions container without ARIA markers
+    // (confirmed via inspection: Lever's location-input field has a
+    // sibling .dropdown-container/.dropdown-results element but no
+    // role="combobox" or aria-autocomplete attribute at all — typing alone
+    // filled the visible text but Lever's own JS resets it back to blank
+    // unless a suggestion is actually clicked, same underlying issue as
+    // the ARIA comboboxes, just without the accessibility hooks to detect
+    // it the same way).
+    const isAriaCombobox = textInput.getAttribute("role") === "combobox" && textInput.getAttribute("aria-autocomplete") === "list";
+    const hasDropdownSuggestions = !!block.querySelector("[class*='dropdown-container'], [class*='dropdown-results']");
+    if (isAriaCombobox || hasDropdownSuggestions) {
+      // A profile value like "Social Media, LinkedIn" is a multi-select
+      // answer stored as a comma-separated string — same convention as
+      // "skills" elsewhere. Previously this whole string was typed as a
+      // single query into the combobox, which never matches any option
+      // (no option is literally labeled "Social Media, LinkedIn"), so the
+      // field silently stayed empty even though a value existed.
+      const isMultiValue = typeof value === "string" && /[,;]/.test(value);
+      let success;
+      if (isMultiValue) {
+        const values = value.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+        success = await fillMultiComboboxField(textInput, values);
+      } else {
+        success = await fillComboboxField(textInput, value);
+      }
+      if (success) filledCount++;
+      else {
+        flaggedForReview++;
+        highlightForManualReview(textInput, questionTitle);
+      }
+    } else {
+      await typeIntoField(textInput, value);
+      filledCount++;
+    }
   }
-  return filledCount;
+  return { filledCount, flaggedForReview };
 }
 
 // ---------- 5. Scan + fill choice fields (radio / checkbox / dropdown) ----------
@@ -354,12 +717,16 @@ async function fillChoiceFields(container, config, profile) {
     }
 
     const { profileKey, score } = bestProfileMatch(questionTitle);
+    console.log(`[Tauzand Autofill] choice question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${CHOICE_MATCH_MIN_CONFIDENCE})`);
     if (score < CHOICE_MATCH_MIN_CONFIDENCE) {
       flaggedForReview++;
       continue;
     }
     let profileValue = profile[profileKey];
-    if (!profileValue) continue;
+    if (!profileValue) {
+      flaggedForReview++; // matched a profile key correctly, but it's empty in Supabase — still needs the user's attention
+      continue;
+    }
 
     // Checkbox groups: "skills" etc. may be a comma-separated string in the
     // profile, not a real array — same fix as Edge Case 5 on the backend.
@@ -374,7 +741,8 @@ async function fillChoiceFields(container, config, profile) {
         const availablePairs = optionPairs.filter((p) => !alreadySelectedTexts.has(p.text));
         const match = selectMatchingOption(availablePairs, valueItem);
         if (!match) continue;
-        match.element.click();
+        console.log(`[Tauzand Autofill] checkbox question "${questionTitle}" — clicking "${match.text}" for value "${valueItem}"`);
+        clickOption(match.element);
         alreadySelectedTexts.add(match.text);
         filledCount++;
         await sleep(CHOICE_CLICK_DELAY_MS);
@@ -383,7 +751,7 @@ async function fillChoiceFields(container, config, profile) {
       const optionPairs = radioOptions.map((el) => ({ text: optionTextFor(el), element: el }));
       const match = selectMatchingOption(optionPairs, profileValue);
       if (match) {
-        match.element.click();
+        clickOption(match.element);
         filledCount++;
         await sleep(CHOICE_CLICK_DELAY_MS);
       }
@@ -391,22 +759,33 @@ async function fillChoiceFields(container, config, profile) {
       const dropdown = dropdownTriggers[0];
       if (dropdown.tagName === "SELECT") {
         const optionPairs = [...dropdown.options].map((opt) => ({ text: opt.textContent, element: opt }));
+        console.log(`[Tauzand Autofill] native <select> "${questionTitle}" options:`, optionPairs.map((p) => p.text), "| target value:", profileValue);
         const match = selectMatchingOption(optionPairs, profileValue);
+        console.log(`[Tauzand Autofill] native <select> best match:`, match ? match.text : "none found");
         if (match) {
-          dropdown.value = match.element.value;
-          dropdown.dispatchEvent(new Event("change", { bubbles: true }));
+          setSelectValue(dropdown, match.element.value);
           filledCount++;
           await sleep(CHOICE_CLICK_DELAY_MS);
+        } else {
+          flaggedForReview++;
+          highlightForManualReview(dropdown, questionTitle);
         }
       } else {
         // Custom (non-<select>) dropdown — Google Forms renders this as a
         // div[role='listbox'] gated by jsaction, which ignores synthetic
         // (untrusted) clicks. trustedClick() routes through chrome.debugger
         // (CDP) instead of dispatchEvent(), so this actually opens it.
+        //
+        // Attach/detach are scoped tightly around just this interaction
+        // (not held for the whole run) so Chrome's "debugging this browser"
+        // infobar only flashes for a second or two here, instead of staying
+        // visible for the entire fill.
         console.log(`[Tauzand Autofill] opening dropdown for "${questionTitle}", target value: "${profileValue}"`);
 
         try {
           await trustedClick(dropdown);
+          await sleep(200);
+          console.log(`[Tauzand Autofill] dropdown aria-expanded after trusted click:`, dropdown.getAttribute("aria-expanded"));
 
           // Poll for the options list to finish rendering.
           let optionElements = [];
@@ -418,9 +797,11 @@ async function fillChoiceFields(container, config, profile) {
             if (optionElements.length > 0 && optionElements.length === previousCount) break;
             previousCount = optionElements.length;
           }
+          console.log(`[Tauzand Autofill] found ${optionElements.length} visible option(s):`, optionElements.map(optionTextFor));
 
           const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
           const match = selectMatchingOption(optionPairs, profileValue);
+          console.log(`[Tauzand Autofill] best match for "${profileValue}":`, match ? match.text : "none found");
           if (match) {
             await trustedClick(match.element);
             filledCount++;
@@ -470,16 +851,23 @@ async function runAutofill(profileId) {
       return; // matches run_fill() on the backend: never attempts to fill past this point
     }
 
-    // Needed for trustedClick() on jsaction-gated widgets (e.g. Google
-    // Forms' custom dropdown) — see the comment in background.js for why a
-    // content script's own dispatchEvent() clicks don't work on these.
+    // Attach the debugger ONCE for the whole fill, not per-field.
+    // Confirmed via testing: repeated rapid attach/detach cycles across
+    // many combobox fields in a row (Location, sponsorship, graduation
+    // date, degree, gender, veteran status, disability...) became
+    // unreliable partway through — later fields silently found zero
+    // options even though the same field type worked fine earlier in the
+    // same run, with no error thrown to explain it. A single stable
+    // attachment for the whole run fixes this, at the cost of Chrome's
+    // "debugging this browser" infobar staying visible for the full fill
+    // instead of flashing briefly per field.
     await chrome.runtime.sendMessage({ type: "DEBUGGER_ATTACH" });
 
     showToast("Filling form...");
     console.log("[Tauzand Autofill] question blocks found:", document.querySelectorAll(config.questionSelector).length);
 
-    const textFilledCount = await fillTextFields(document, config, profile);
-    console.log("[Tauzand Autofill] text fields filled:", textFilledCount);
+    const { filledCount: textFilledCount, flaggedForReview: textFlaggedForReview } = await fillTextFields(document, config, profile);
+    console.log("[Tauzand Autofill] text fields filled:", textFilledCount, "| flagged for review:", textFlaggedForReview);
 
     showToast("Re-checking for CAPTCHA/login wall...");
     const captchaAppearedMidFill = await checkForCaptcha();
@@ -489,12 +877,13 @@ async function runAutofill(profileId) {
       return;
     }
 
-    const { filledCount: choiceFilledCount, flaggedForReview } = await fillChoiceFields(document, config, profile);
+    const { filledCount: choiceFilledCount, flaggedForReview: choiceFlaggedForReview } = await fillChoiceFields(document, config, profile);
 
     const totalFilled = textFilledCount + choiceFilledCount;
+    const totalFlagged = textFlaggedForReview + choiceFlaggedForReview;
     showToast(
-      flaggedForReview > 0
-        ? `\u2705 Filled ${totalFilled} fields — ${flaggedForReview} left for you to review`
+      totalFlagged > 0
+        ? `\u2705 Filled ${totalFilled} fields — ${totalFlagged} left for you to review`
         : `\u2705 Filled ${totalFilled} fields`
     );
   } catch (err) {

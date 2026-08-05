@@ -9,8 +9,10 @@
   "host_permissions": [
     "http://localhost:5000/*",
     "https://*.myworkday.com/*",
+    "https://*.myworkdayjobs.com/*",
     "https://*.greenhouse.io/*",
     "https://*.ashbyhq.com/*",
+    "https://jobs.lever.co/*",
     "https://docs.google.com/forms/*"
   ],
 
@@ -22,8 +24,10 @@
     {
       "matches": [
         "https://*.myworkday.com/*",
+        "https://*.myworkdayjobs.com/*",
         "https://*.greenhouse.io/*",
         "https://*.ashbyhq.com/*",
+        "https://jobs.lever.co/*",
         "https://docs.google.com/forms/*"
       ],
       "js": ["platform_selectors.js", "matcher.js", "content.js"],
