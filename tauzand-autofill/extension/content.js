@@ -100,8 +100,8 @@ function injectBanner(onClick) {
     if (window.location.href !== lastKnownUrl) {
       console.log("[Tauzand Autofill] URL changed (new page/step) — resetting banner to fresh prompt");
       lastKnownUrl = window.location.href;
-      const banner = document.getElementById("tauzand-autofill-banner");
-      if (banner) banner.textContent = "\u26A1 Autofill this form";
+      const statusLine = document.getElementById("tauzand-autofill-banner-status");
+      if (statusLine) statusLine.textContent = "\u26A1 Autofill this form";
     }
   }, 1000);
 }
@@ -111,7 +111,6 @@ function createBanner(onClick) {
 
   const banner = document.createElement("div");
   banner.id = "tauzand-autofill-banner";
-  banner.textContent = "\u26A1 Autofill this form";
   Object.assign(banner.style, {
     position: "fixed",
     top: "16px",
@@ -119,24 +118,61 @@ function createBanner(onClick) {
     zIndex: "2147483647",
     background: "#1F4E79",
     color: "#ffffff",
-    padding: "14px 22px",
-    borderRadius: "10px",
+    padding: "16px 20px",
+    borderRadius: "12px",
     fontFamily: "system-ui, sans-serif",
-    fontSize: "16px",
-    fontWeight: "600",
     cursor: "pointer",
     boxShadow: "0 4px 14px rgba(0,0,0,0.35)",
-    whiteSpace: "nowrap",
-    lineHeight: "1.4",
+    width: "300px",
   });
+
+  // Separate status line — this is what showToast() updates, so the
+  // disclaimer below it survives every status change instead of being
+  // wiped out along with the message text.
+  const statusLine = document.createElement("div");
+  statusLine.id = "tauzand-autofill-banner-status";
+  statusLine.textContent = "\u26A1 Autofill this form";
+  Object.assign(statusLine.style, {
+    fontSize: "16px",
+    fontWeight: "600",
+    lineHeight: "1.4",
+    whiteSpace: "normal",
+  });
+  banner.appendChild(statusLine);
+
+  // Persistent disclaimer — required per Chawal's instructions. A subtle
+  // divider + extra spacing + softer color separates it visually from the
+  // status line above, instead of the two running together.
+  const disclaimer = document.createElement("div");
+  disclaimer.id = "tauzand-autofill-banner-disclaimer";
+  Object.assign(disclaimer.style, {
+    fontSize: "11.5px",
+    fontWeight: "400",
+    marginTop: "10px",
+    paddingTop: "10px",
+    borderTop: "1px solid rgba(255,255,255,0.25)",
+    color: "rgba(255,255,255,0.75)",
+    lineHeight: "1.5",
+    whiteSpace: "normal",
+  });
+  disclaimer.innerHTML =
+    'Always verify the content before final submitting. ' +
+    '<a href="https://www.tauzand.in/terms-and-conditions" target="_blank" rel="noopener noreferrer" style="color:#ffffff;text-decoration:underline;">Terms &amp; Conditions</a>';
+  // Stop the click from bubbling up to the banner's own click handler —
+  // otherwise clicking the T&C link would also trigger autofill.
+  disclaimer.addEventListener("click", (e) => e.stopPropagation());
+  banner.appendChild(disclaimer);
+
   banner.addEventListener("click", onClick);
   document.documentElement.appendChild(banner);
   console.log("[Tauzand Autofill] banner appended to page, present in DOM:", !!document.getElementById("tauzand-autofill-banner"));
 }
 
 function showToast(message) {
-  const banner = document.getElementById("tauzand-autofill-banner");
-  if (banner) banner.textContent = message;
+  // Targets just the status line, not the whole banner, so the persistent
+  // disclaimer below it isn't wiped out on every status update.
+  const statusLine = document.getElementById("tauzand-autofill-banner-status");
+  if (statusLine) statusLine.textContent = message;
 }
 
 // ---------- 2b. Manual-review highlighting ----------
