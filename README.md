@@ -1,60 +1,93 @@
-# Tauzand Auto-Apply — Execution Checkpoint
+# Tauzand Auto-Apply — Chrome Extension + Backend
 
-This repo is the working prototype for the "Backend Form Auto-Fill Validation" checkpoint.
-It demonstrates the core mechanism (not the polished product): a Flask backend that reads a
-candidate profile from Supabase, drives a real Chrome session with Selenium, detects form
-fields, fills them, and pauses with an audio alert whenever it hits something that needs a
-human (login wall, CAPTCHA, "I'm not a robot" check).
+This repo has two working pieces now:
+
+1. A **Chrome extension** (`extension/`) that auto-detects a supported job-application page,
+   shows a one-click "Autofill this form" banner, and fills the form directly in the browser
+   tab — this is the primary, user-facing way the tool actually gets used.
+2. A **Flask + Selenium backend** (`backend/`) that does the same job-filling logic through a
+   driven browser session instead of a content script. It started as the original checkpoint
+   prototype and is still useful for testing/reference, and it's what the extension's profile
+   data is served from (`GET /api/profile/<id>`).
+
+Both read the same candidate profile from Supabase and share the same core idea: scan the
+form, match each question to a profile field, fill what it's confident about, and always leave
+consent/CAPTCHA/login situations for a human.
 
 ## What's in here
 
 ```
 tauzand-autofill/
-├── backend/                  Flask app (the thing that does the work)
-│   ├── app.py                 REST routes
-│   ├── config.py               All tunables in one place (no hardcoded values buried in logic)
+├── backend/                    Flask app + Selenium fill engine
+│   ├── app.py                   REST routes (profile fetch, resume upload, etc.)
+│   ├── config.py                 All tunables in one place (timing, thresholds, keyword lists)
 │   ├── requirements.txt
 │   ├── services/
-│   │   ├── supabase_client.py  Profile storage (Supabase, free tier)
-│   │   ├── platform_configs.py Per-platform selectors/config (this is how you add a
-│   │   │                       new site without touching form_filler.py)
-│   │   ├── form_filler.py      Selenium-driven field detection + fill engine
-│   │   ├── captcha_detector.py Heuristics + OCR hook to detect (never solve) CAPTCHAs
-│   │   ├── ocr_service.py      Hardcoded Tesseract OCR wrapper
-│   │   └── audio_alert.py      Cross-platform beep for "come intervene" moments
-│   └── README.md               Backend-specific setup instructions
-├── frontend/                  Next.js + TS + Tailwind (bare, no polish per brief)
+│   │   ├── supabase_client.py    Profile storage (Supabase, free tier)
+│   │   ├── platform_configs.py   Per-platform selectors/config for the Selenium engine
+│   │   ├── form_filler.py        Selenium-driven field detection + fill engine
+│   │   ├── captcha_detector.py   Heuristics + OCR hook to detect (never solve) CAPTCHAs
+│   │   ├── ocr_service.py        Tesseract OCR wrapper
+│   │   └── audio_alert.py        Cross-platform beep for "come intervene" moments
+│   └── README.md                 Backend-specific setup instructions
+├── extension/                  Chrome extension (Manifest V3) — the real product
+│   ├── manifest.json             Site permissions + which pages the content script runs on
+│   ├── content.js                 Scan/match/fill logic, runs in the page itself
+│   ├── background.js              Profile fetch (CORS) + chrome.debugger trusted-click service
+│   ├── matcher.js                 Label -> profile-field matching (mirrors form_filler.py's logic)
+│   ├── platform_selectors.js      Per-platform DOM selectors, one config block per site
+│   ├── popup.html / popup.js      Toolbar popup: set profile ID, manual "Fill Now" button
+│   └── README.md                  Setup + per-platform notes and known gaps
+├── frontend/                   Next.js + TS + Tailwind dashboard (bare, no polish per brief)
 │   ├── app/
-│   └── lib/api.ts              Talks to the Flask REST routes
-└── DESIGN_DOC.md              Architecture notes + edge case log — paste this into the
-                                shared Google Doc the client asked for
+│   └── lib/api.ts                Talks to the Flask REST routes
+└── DESIGN_DOC.md               Architecture notes + edge case log — mirrors the shared
+                                 Google Doc used as the ongoing communication channel
 ```
 
-## What I could and couldn't do here
+## Platform support status
 
-I can write and hand you working, tested-as-far-as-possible code. I can't do the following
-for you, since they need your accounts/credentials or a real screen to record:
+| Platform | Status |
+|---|---|
+| Google Forms | Done — text fields, radio/checkbox, dropdowns, legal-consent detection, CAPTCHA/login-wall detection |
+| Ashby | Done — including custom (non-native) button/checkbox widgets, autocomplete "Current Location" field, multi-select questions |
+| Greenhouse | Done — text fields, react-select dropdowns, checkbox/radio question groups, legal-consent detection |
+| Lever | Done — text fields, native `<select>` dropdowns, checkbox groups, non-ARIA location autocomplete |
+| Workday | Not started — domain permissions are already in `manifest.json` and a starter selector config exists in `platform_selectors.js`, but it hasn't been tested against a live tenant yet |
+| LinkedIn | Deliberately not attempted — LinkedIn's User Agreement prohibits automation on the platform, and their system actively detects it. Doing this on a real account risks a restriction or ban, so this needs an explicit decision before any work starts on it, not a code change |
 
-- **Create the Supabase project / get real API keys.** `supabase_client.py` is wired to real
-  Supabase Python SDK calls — you just need to sign up (free tier), create a `profiles` table,
-  and drop the URL + anon key into a `.env` file (see `backend/README.md`).
-- **Record and upload the video demo to Google Drive.** Once you run this locally against
-  a Google Form (the easiest, most reliable reference target — no anti-bot walls), you can
-  screen-record the flow described in `DESIGN_DOC.md`'s "Demo Script" section.
-- **Create the shared Google Doc.** `DESIGN_DOC.md` is written so you can paste it directly in.
+## Design decisions worth knowing
+
+- **Legal/consent checkboxes are never auto-checked.** Any question matching a consent/policy
+  keyword (`config.py`'s `LEGAL_CHECKBOX_KEYWORDS` / the same list in `matcher.js`) is always
+  left for the user, with an audio alert, regardless of confidence.
+- **CAPTCHA/login walls stop the run, not bypass it.** Detection is layered (DOM signals, text
+  keywords, OCR fallback on the backend); on a hit, the run stops and hands off to the user.
+- **Some widgets need a genuinely trusted click.** A handful of sites (Google Forms' custom
+  dropdown, Greenhouse/Ashby's react-select comboboxes) gate their open/select behavior on
+  `event.isTrusted`, which a content script's own `dispatchEvent()` can never satisfy. The
+  extension routes those specific interactions through `chrome.debugger` (Chrome DevTools
+  Protocol) instead, which dispatches genuinely trusted input — see `background.js` and the
+  `trustedClick()` comments in `content.js` for the detail.
+- **`.env` always overrides `config.py` defaults.** When changing a timing/behavior setting on
+  the backend, check both files — a value set in `.env` silently wins over a code default.
 
 ## Quick start
 
 ```bash
 # Backend
 cd backend
-python -m venv venv && source venv/bin/activate
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in SUPABASE_URL / SUPABASE_KEY
+cp .env.example .env   # fill in SUPABASE_URL / SUPABASE_KEY / etc.
 python app.py           # runs on http://localhost:5000
 
-# Frontend
-cd ../frontend
+# Extension
+# chrome://extensions -> enable Developer mode -> Load unpacked -> select extension/
+# then add the extension's ID to CORS_ORIGINS in backend/.env and restart the backend
+
+# Frontend (optional dashboard)
+cd frontend
 npm install
 npm run dev              # runs on http://localhost:3000
 ```
@@ -66,25 +99,28 @@ npm run dev              # runs on http://localhost:3000
   to switch to live mode, which you'd only do for the mentor-approved emergency case the
   SOP describes.
 - **Naming/comments (SOP §3.2–3.4):** variables use full descriptive names with inline
-  same-line comments explaining purpose; the one dict used for optimization
-  (`FIELD_LABEL_HINTS` in `form_filler.py`, and the in-memory session store in `app.py`)
-  has a TC/SC comment directly above it.
-- **Edge cases (SOP §3.5):** `form_filler.py` and `app.py` each end with an "Edge Cases
-  Handled" comment block; `DESIGN_DOC.md` has the fuller table for the video/doc.
+  same-line comments explaining purpose; the shared matching dictionary
+  (`FIELD_LABEL_HINTS`, present in both `form_filler.py` and `matcher.js`) has a comment
+  directly above it explaining the scoring approach.
+- **Edge cases (SOP §3.5):** `content.js`, `form_filler.py`, and `platform_selectors.js` each
+  carry inline comments documenting the specific bug/edge case that shaped each fix (fieldset
+  vs div containers, trusted-click gating, React-controlled inputs, etc.); `DESIGN_DOC.md` has
+  the fuller running table.
 - **Color palette (SOP §4.2):** `frontend/tailwind.config.ts` restricts to Sapphire Veil
   (blue, primary actions/confident results) and Imperial Topaz (amber, attention/skipped
   states) plus neutral grays and `rose` instead of pure red.
 - **Env vars (SOP §3.7):** backend reads everything through `config.py` from `.env`;
-  frontend reads the API base from `NEXT_PUBLIC_API_BASE` — see `.env.example` /
-  `.env.local.example`. No secrets are hardcoded anywhere in the repo.
-- **AI disclosure (SOP §2):** this repo was scaffolded with AI assistance and then needs
-  your own read-through before any PR — the SOP requires you understand every function
-  before submitting, not just that it runs.
+  frontend reads the API base from `NEXT_PUBLIC_API_BASE`. No secrets are hardcoded in the
+  repo — `.gitignore` excludes `backend/.env` and `frontend/.env.local`.
+- **AI disclosure (SOP §2):** this repo was built with AI assistance throughout (backend,
+  extension, and debugging) and each change was tested against a real, live posting on the
+  target platform before being considered done — not just that it runs, but that it's been
+  seen working on an actual form.
 
-## Reference platform used for the demo
+## Reference platforms used so far
 
-Per the brief's suggestion of Workday / Ashley / Google Forms, this prototype targets
-**Google Forms** as the primary, reliably-testable reference target, since Workday and most
-ATS platforms sit behind auth walls and bot-detection that would make a first checkpoint demo
-flaky through no fault of the code. The `platform_configs.py` module is written so Workday and
-others are a config addition, not a rewrite — see `DESIGN_DOC.md` for how that extends.
+Google Forms, Ashby, Greenhouse, and Lever were chosen because they allow guest/unauthenticated
+applications, so they can be tested end-to-end without needing a company account. Workday and
+most enterprise ATS platforms sit behind tenant-specific auth walls, which makes them a
+separate, later effort. `platform_selectors.js` (extension) and `platform_configs.py` (backend)
+are both written so a new platform is a config addition, not a rewrite.
