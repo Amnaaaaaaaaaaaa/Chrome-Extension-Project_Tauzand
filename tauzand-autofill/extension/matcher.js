@@ -25,19 +25,23 @@ const FIELD_LABEL_HINTS = {
   eu_efta_citizen: ["citizen of a country in the eu", "eu/efta", "european union"],
   languages: ["languages", "which languages", "language proficiency", "language skill"],
   date_of_birth: ["date of birth", "birth date", "birthday", "dob"],
+  postal_code: ["postal code", "zip code", "zip", "postcode"],
+  field_of_study: ["field of study", "major", "area of study"],
+  cgpa: ["cgpa", "gpa", "overall result", "grade point average"],
+  education_start_year: ["first year attended", "start year", "year started", "from"],
   linkedin_url: ["linkedin"],
   portfolio_url: ["portfolio", "website"],
   referral_source: ["how did you hear", "how you heard", "referral source", "how did you find", "how did you learn about"],
   preferred_work_location: ["preferred work location", "work location", "work arrangement", "remote or on-site"],
-  skills: ["which skills", "select your skills", "skills do you have", "technical skills"],
+  skills: ["type to add skills", "which skills", "select your skills", "skills do you have", "technical skills", "skills"],
   pronouns: ["pronouns", "preferred pronouns"],
   work_authorized_us: ["authorized to work", "work authorization", "legally authorized"],
   visa_sponsorship_status: ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
   willing_to_relocate: ["willing to relocate", "able to relocate", "relocate for this role"],
   github_url: ["github"],
   school: ["school", "university", "college"],
-  graduation_date: ["expect to graduate or complete your program", "intended graduation year", "graduation date", "expected graduation", "when do you expect to graduate"],
-  degree_type: ["what degree are you currently pursuing", "degree type", "degree you are", "what degree"],
+  graduation_date: ["expect to graduate or complete your program", "intended graduation year", "to (actual or expected)", "graduation date", "expected graduation", "when do you expect to graduate"],
+  degree_type: ["what degree are you currently pursuing", "degree type", "degree you are", "what degree", "degree"],
   prior_internships_count: ["prior internships", "how many internships", "number of internships"],
   gender: ["gender identity", "gender"],
   race: ["race", "ethnicity", "race & ethnicity", "race and ethnicity"],
@@ -102,6 +106,15 @@ function bestProfileMatch(label) {
   return { profileKey: bestKey, score: bestScore };
 }
 
+// Strips apostrophes entirely and collapses other punctuation/whitespace to
+// single spaces, so "Bachelor's" and "Bachelors" (or any other punctuation
+// variant) compare as identical. Used on top of the existing similarity
+// scoring, not instead of it — this only removes noise that was causing
+// otherwise-correct matches to score too low.
+function normalizeForMatch(s) {
+  return s.toLowerCase().replace(/['\u2019]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 /**
  * Mirrors _select_matching_option(): given a list of {text, element} option
  * pairs and a target profile value, returns the best-matching pair or null.
@@ -110,6 +123,7 @@ function selectMatchingOption(optionPairs, targetValue, minRatio = 0.55) {
   if (targetValue === null || targetValue === undefined) return null;
   const targetLower = String(targetValue).trim().toLowerCase();
   if (!targetLower) return null;
+  const targetNormalized = normalizeForMatch(targetLower);
 
   let bestPair = null;
   let bestScore = 0.0;
@@ -117,10 +131,15 @@ function selectMatchingOption(optionPairs, targetValue, minRatio = 0.55) {
   for (const pair of optionPairs) {
     const optionLower = pair.text.trim().toLowerCase();
     if (!optionLower) continue;
-    let score = similarityRatio(optionLower, targetLower);
-    if (optionLower.includes(targetLower) || targetLower.includes(optionLower)) {
-      const shorterLen = Math.min(optionLower.length, targetLower.length);
-      const longerLen = Math.max(optionLower.length, targetLower.length, 1);
+    const optionNormalized = normalizeForMatch(optionLower);
+
+    let score = Math.max(similarityRatio(optionLower, targetLower), similarityRatio(optionNormalized, targetNormalized));
+    if (
+      optionLower.includes(targetLower) || targetLower.includes(optionLower) ||
+      optionNormalized.includes(targetNormalized) || targetNormalized.includes(optionNormalized)
+    ) {
+      const shorterLen = Math.min(optionNormalized.length, targetNormalized.length);
+      const longerLen = Math.max(optionNormalized.length, targetNormalized.length, 1);
       const coverageBonus = 0.25 * (shorterLen / longerLen);
       score = Math.max(score, 0.70 + coverageBonus);
     }

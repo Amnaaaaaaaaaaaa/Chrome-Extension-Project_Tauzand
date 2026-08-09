@@ -7,32 +7,23 @@ label-matching heuristic for a real NLP/LLM call later is a one-function change.
 This talks to platform_configs.py for "where things are on this site" and to
 captcha_detector.py for "should I stop and ask a human right now".
 """
+import importlib
 import random
 import re
 import time
 import uuid
 from difflib import SequenceMatcher
-from typing import Any, Dict
+from typing import Any
 
-try:
-    from selenium import webdriver  # type: ignore[import]
-    from selenium.webdriver.chrome.options import Options  # type: ignore[import]
-    from selenium.webdriver.common.by import By  # type: ignore[import]
-    from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[import]
-    from selenium.webdriver.support import expected_conditions as EC  # type: ignore[import]
-    from selenium.common.exceptions import (  # type: ignore[import]
-        TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
-    )
-except ImportError:
-    webdriver = None
-    Options = None
-    By = None
-    WebDriverWait = None
-    EC = None
-    TimeoutException = Exception
-    NoSuchElementException = Exception
-    WebDriverException = Exception
-    StaleElementReferenceException = Exception
+from selenium import webdriver  # type: ignore[import-not-found]
+from selenium.webdriver.chrome.options import Options  # type: ignore[import-not-found]
+from selenium.webdriver.common.by import By  # type: ignore[import-not-found]
+from selenium.webdriver.support.ui import WebDriverWait  # type: ignore[import-not-found]
+from selenium.webdriver.support import expected_conditions as EC  # type: ignore[import-not-found]
+from selenium.common.exceptions import (  # type: ignore[import-not-found]
+    TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
+)
+
 
 from config import Config
 from services import platform_configs
@@ -60,15 +51,39 @@ FIELD_LABEL_HINTS = {
     "phone": ["phone", "mobile", "contact number"],
     "address": ["home address", "street address", "mailing address", "address", "street"],
     "city": ["city"],
+    "current_location": ["current location", "location"],
+    "requires_visa_sponsorship": ["now or in the future require", "will you in the future require immigration sponsorship", "require immigration sponsorship"],
+    "currently_enrolled": ["will return to the program upon completion", "currently enrolled in a university"],
+    "veteran_status": ["veteran status", "protected veteran"],
+    "disability_status": ["disability status", "do you have a disability"],
+    "current_company": ["current company", "current employer", "where do you currently work"],
+    "eu_efta_citizen": ["citizen of a country in the eu", "eu/efta", "european union"],
+    "languages": ["languages", "which languages", "language proficiency", "language skill"],
+    "date_of_birth": ["date of birth", "birth date", "birthday", "dob"],
+    "postal_code": ["postal code", "zip code", "zip", "postcode"],
+    "field_of_study": ["field of study", "major", "area of study"],
+    "cgpa": ["cgpa", "gpa", "overall result", "grade point average"],
+    "education_start_year": ["first year attended", "start year", "year started", "from"],
     "linkedin_url": ["linkedin"],
     "portfolio_url": ["portfolio", "website"],
     "referral_source": ["how did you hear", "how you heard", "referral source", "how did you find", "how did you learn about"],
     "preferred_work_location": ["preferred work location", "work location", "work arrangement", "remote or on-site"],
-    "skills": ["which skills", "select your skills", "skills do you have", "technical skills"],
+    "skills": ["type to add skills", "which skills", "select your skills", "skills do you have", "technical skills", "skills"],
+    "pronouns": ["pronouns", "preferred pronouns"],
+    "work_authorized_us": ["authorized to work", "work authorization", "legally authorized"],
+    "visa_sponsorship_status": ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
+    "willing_to_relocate": ["willing to relocate", "able to relocate", "relocate for this role"],
+    "github_url": ["github"],
+    "school": ["school", "university", "college"],
+    "graduation_date": ["expect to graduate or complete your program", "intended graduation year", "to (actual or expected)", "graduation date", "expected graduation", "when do you expect to graduate"],
+    "degree_type": ["what degree are you currently pursuing", "degree type", "degree you are", "what degree", "degree"],
+    "prior_internships_count": ["prior internships", "how many internships", "number of internships"],
+    "gender": ["gender identity", "gender"],
+    "race": ["race", "ethnicity", "race & ethnicity", "race and ethnicity"],
 }
 
 
-def build_driver() -> Any:
+def build_driver() -> webdriver.Chrome:
     options = Options()
     if Config.SELENIUM_HEADLESS:
         options.add_argument("--headless=new")
@@ -240,6 +255,16 @@ def _option_text_for(option_element) -> str:
     return option_element.text.strip()
 
 
+def _normalize_for_match(s: str) -> str:
+    """Strips apostrophes entirely and collapses other punctuation/whitespace
+    to single spaces, so "Bachelor's" and "Bachelors" (or any other
+    punctuation variant) compare as identical. Used on top of the existing
+    similarity scoring, not instead of it — kept in sync with matcher.js's
+    normalizeForMatch()."""
+    s = s.replace("'", "").replace("\u2019", "")
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
 def _select_matching_option(option_pairs: list[tuple[str, object]], target_value, min_ratio: float = 0.55):
     """
     Given a list of (option_display_text, option_element) pairs scraped from
@@ -267,14 +292,22 @@ def _select_matching_option(option_pairs: list[tuple[str, object]], target_value
         return None
 
     best_pair, best_score = None, 0.0
+    target_normalized = _normalize_for_match(target_lower)
     for option_text, option_element in option_pairs:
         option_lower = option_text.strip().lower()
         if not option_lower:
             continue
-        score = SequenceMatcher(None, option_lower, target_lower).ratio()
-        if option_lower in target_lower or target_lower in option_lower:
-            shorter_len = min(len(option_lower), len(target_lower))
-            longer_len = max(len(option_lower), len(target_lower), 1)
+        option_normalized = _normalize_for_match(option_lower)
+        score = max(
+            SequenceMatcher(None, option_lower, target_lower).ratio(),
+            SequenceMatcher(None, option_normalized, target_normalized).ratio(),
+        )
+        if (
+            option_lower in target_lower or target_lower in option_lower
+            or option_normalized in target_normalized or target_normalized in option_normalized
+        ):
+            shorter_len = min(len(option_normalized), len(target_normalized))
+            longer_len = max(len(option_normalized), len(target_normalized), 1)
             coverage_bonus = 0.25 * (shorter_len / longer_len)
             score = max(score, 0.70 + coverage_bonus)
         if score > best_score:
@@ -505,7 +538,7 @@ def fill_fields(fields: list[dict], profile: dict, min_confidence: float = 0.75)
 # a strong reference here is what makes the window stay open for manual
 # review/submission as intended.
 # TC: O(1) average insert/lookup/delete per driver_id | SC: O(n) for n open sessions
-_open_drivers: Dict[str, Any] = {}
+_open_drivers: dict[str, webdriver.Chrome] = {}
 
 
 def close_driver(driver_id: str) -> bool:

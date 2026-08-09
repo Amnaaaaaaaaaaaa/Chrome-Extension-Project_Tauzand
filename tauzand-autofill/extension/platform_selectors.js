@@ -64,15 +64,30 @@ const PLATFORM_SELECTORS = {
 
   workday: {
     matchHost: (host) => host.includes("myworkday.com") || host.includes("myworkdayjobs.com"),
-    // Workday tags most interactive elements with data-automation-id, but
-    // the exact values vary by tenant/version — VERIFY on the real tenant
-    // you're testing against and adjust these.
-    questionSelector: "[data-automation-id='formField']",
+    // Confirmed via live DOM inspection (a real Workday posting, Motorola
+    // Solutions tenant): data-automation-id on the question container is
+    // "formField-<specific-field-name>" (e.g. "formField-legalName--
+    // firstName"), never the literal string "formField" alone — the exact-
+    // match selector below was matching zero elements on every real
+    // tenant, hence "question blocks found: 0". "^=" (starts-with) fixes
+    // this regardless of what follows the "formField-" prefix.
+    questionSelector: "[data-automation-id^='formField']",
     questionTitleSelector: "label, [data-automation-id='label']",
-    textInputSelector: "input[data-automation-id='textInputBox'], input[type='text']",
+    // Confirmed via inspection: some fields (e.g. the education "Year"
+    // input) have no type attribute at all, so "input[type='text']" alone
+    // never matched them — "input:not([type])" catches those too.
+    // "input[role='spinbutton']" added specifically for date/year fields.
+    textInputSelector: "input[type='text'], input:not([type]), input[role='spinbutton']",
+    // Not yet confirmed against a live radio/checkbox question on this
+    // tenant — reasonable defaults for now, verify and adjust once
+    // one is found (same process used for the text field above).
     radioSelector: "input[data-automation-id='radioInput'], input[type='radio']",
     checkboxSelector: "input[data-automation-id='checkboxInput'], input[type='checkbox']",
-    selectSelector: "[data-automation-id='multiSelectContainer'], select",
+    // "button[aria-haspopup='listbox']" added for the Degree field —
+    // confirmed via inspection it's a <button> with no data-automation-id
+    // at all, invisible to the previous selector entirely (so it never
+    // showed up as filled OR flagged for review — just silently skipped).
+    selectSelector: "[data-automation-id='multiSelectContainer'], [data-automation-id*='select' i], button[aria-haspopup='listbox'], select",
     // Workday often renders the actual application form inside an <iframe>.
     // manifest.json's "all_frames": true means this content script also
     // runs inside that iframe automatically, so no extra wiring is needed

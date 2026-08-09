@@ -82,9 +82,26 @@ function injectBanner(onClick) {
   // robust regardless of why it disappeared, since it doesn't depend on
   // catching a specific removal event that a full context teardown could
   // also wipe out along with everything else.
+  //
+  // Also tracks the URL: Workday's multi-page apply flow (My Information ->
+  // My Experience -> Application Questions -> ...) is a single-page app —
+  // the banner element itself survives page-to-page, but its text was
+  // staying stuck on the PREVIOUS page's result ("Filled 11 fields...")
+  // instead of resetting to the fresh prompt, which looked broken/confusing
+  // even though clicking it still worked. Detecting a URL change and
+  // resetting the banner's text fixes this.
+  let lastKnownUrl = window.location.href;
   setInterval(() => {
     if (!document.getElementById("tauzand-autofill-banner")) {
       createBanner(onClick);
+      lastKnownUrl = window.location.href;
+      return;
+    }
+    if (window.location.href !== lastKnownUrl) {
+      console.log("[Tauzand Autofill] URL changed (new page/step) — resetting banner to fresh prompt");
+      lastKnownUrl = window.location.href;
+      const banner = document.getElementById("tauzand-autofill-banner");
+      if (banner) banner.textContent = "\u26A1 Autofill this form";
     }
   }, 1000);
 }
@@ -234,6 +251,17 @@ function clickOption(element) {
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
+// Falls back to a related field when the requested one is empty — e.g.
+// there's no separate "city" value in Supabase, only "current_location", so
+// a "City" question reuses that instead of being left blank/manual.
+function resolveProfileValue(profile, profileKey) {
+  let value = profile[profileKey];
+  if (!value && profileKey === "city") {
+    value = profile.current_location;
+  }
+  return typeof value === "string" ? value.trim() : value;
+}
+
 function optionTextFor(element) {
   const ariaLabel = (element.getAttribute("aria-label") || "").trim();
   if (ariaLabel) return ariaLabel;
@@ -297,6 +325,16 @@ const TYPE_DELAY_MAX_MS = 220;
 // instantly back-to-back.
 const CHOICE_CLICK_DELAY_MS = 350;
 
+// For these profile fields, a comma-separated value list means "try in
+// priority order, stop at the first one that matches" — not "select every
+// matching one". Confirmed via testing on Workday: selecting "Social Media"
+// then searching for "LinkedIn" (which doesn't exist as a separate option
+// on that company's form) left the field looking empty/broken instead of
+// keeping the first successful pick. referral_source is a priority list by
+// nature (how did you hear about us — pick the best single answer), unlike
+// "skills" or "languages" where selecting every match is actually wanted.
+const PRIORITY_ONLY_FIELDS = new Set(["referral_source"]);
+
 async function typeIntoField(element, value) {
   const text = String(value);
   element.focus();
@@ -332,7 +370,7 @@ async function typeIntoField(element, value) {
 // value is a comma-separated list) — selects one option per value in
 // sequence, reusing a single debugger attachment for the whole field
 // instead of attaching/detaching per value.
-async function fillMultiComboboxField(input, values) {
+async function fillMultiComboboxField(input, values, profileKey) {
   let selectedAny = false;
   try {
     for (const value of values) {
@@ -346,7 +384,7 @@ async function fillMultiComboboxField(input, values) {
       const pollStart = Date.now();
       while (Date.now() - pollStart < 1500) {
         await sleep(150);
-        optionElements = [...document.querySelectorAll("[role='option'], [class*='__option'], .dropdown-results > *")].filter(isVisible);
+        optionElements = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [class*='__option'], .dropdown-results > *")].filter(isVisible);
         if (optionElements.length > 0 && optionElements.length === previousCount) break;
         previousCount = optionElements.length;
       }
@@ -359,6 +397,7 @@ async function fillMultiComboboxField(input, values) {
           await trustedClick(match.element);
           selectedAny = true;
           await sleep(CHOICE_CLICK_DELAY_MS);
+          if (PRIORITY_ONLY_FIELDS.has(profileKey)) break; // e.g. referral_source: first match wins, don't try the rest
         }
       }
       // Clear the input text before the next value, in case the menu
@@ -400,7 +439,7 @@ async function fillComboboxField(input, value) {
         // "[class*='__option']" added alongside role='option' — react-select
         // (used by both Ashby and Greenhouse's dropdowns) commonly names its
         // option elements with a BEM-style "{prefix}__option" class.
-        elements = [...document.querySelectorAll("[role='option'], [class*='__option'], .dropdown-results > *")].filter(isVisible);
+        elements = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [class*='__option'], .dropdown-results > *")].filter(isVisible);
         if (elements.length > 0 && elements.length === previousCount) break;
         previousCount = elements.length;
       }
@@ -601,7 +640,13 @@ async function checkForLoginWall() {
 
 // ---------- 4. Scan + fill text fields ----------
 async function fillTextFields(container, config, profile) {
-  const blocks = container.querySelectorAll(config.questionSelector);
+  // Filtered to only currently-visible blocks — confirmed necessary on
+  // Workday: its multi-page apply flow (My Information -> My Experience ->
+  // ...) keeps EARLIER pages' fields in the DOM but hidden rather than
+  // removing them, so an unfiltered scan was picking up stale fields from
+  // steps already completed and inflating/corrupting the filled/flagged
+  // counts shown on the banner.
+  const blocks = [...container.querySelectorAll(config.questionSelector)].filter(isVisible);
   let filledCount = 0;
   let flaggedForReview = 0;
 
@@ -632,11 +677,32 @@ async function fillTextFields(container, config, profile) {
     }
 
     const { profileKey, score } = bestProfileMatch(questionTitle);
+    console.log(`[Tauzand Autofill] text question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${MIN_TEXT_FIELD_CONFIDENCE})`);
     if (score < MIN_TEXT_FIELD_CONFIDENCE) {
       flaggedForReview++; // real text field, but couldn't confidently match it to a profile key
       continue;
     }
-    const value = profile[profileKey];
+    // "from" is a bare, generic hint (shared by Education's "From" field
+    // and Work Experience's "From" field) — safe on a first run since Work
+    // Experience's fields don't exist yet at this point, but on a second
+    // run (after fillWorkExperienceSection has already created panels) this
+    // guard stops a Work Experience "From" from being wrongly matched to
+    // education_start_year, since Work Experience's own dates are filled
+    // separately via exact data-automation-id matching, not this hint.
+    if (profileKey === "education_start_year" && block.closest('[aria-labelledby*="Work-Experience"]')) {
+      flaggedForReview++;
+      continue;
+    }
+    // If the flexible multi-entry "education" array is populated, defer
+    // entirely to fillEducationSection() for these fields — letting this
+    // generic flat-field scan also touch the same Education panel risks
+    // conflicting/duplicate fills (e.g. opening the same dropdown twice).
+    const EDUCATION_ARRAY_FIELDS = new Set(["school", "degree_type", "field_of_study", "cgpa", "graduation_date", "education_start_year"]);
+    if (EDUCATION_ARRAY_FIELDS.has(profileKey) && profile.education) {
+      flaggedForReview++;
+      continue;
+    }
+    const value = resolveProfileValue(profile, profileKey);
     if (!value) {
       // Matched a profile key correctly, but that field is empty in
       // Supabase — this used to be silently dropped from both counts,
@@ -670,7 +736,7 @@ async function fillTextFields(container, config, profile) {
       let success;
       if (isMultiValue) {
         const values = value.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
-        success = await fillMultiComboboxField(textInput, values);
+        success = await fillMultiComboboxField(textInput, values, profileKey);
       } else {
         success = await fillComboboxField(textInput, value);
       }
@@ -680,7 +746,27 @@ async function fillTextFields(container, config, profile) {
         highlightForManualReview(textInput, questionTitle);
       }
     } else {
-      await typeIntoField(textInput, value);
+      // A bare Year spinbutton (e.g. Education's "To"/"From" fields, which
+      // — unlike Work Experience's start/end dates — have no separate
+      // Month input) needs just the 4-digit year, not the full profile
+      // value (which might be a full date string like "1 June 2027").
+      const isYearOnlySpinbutton =
+        textInput.getAttribute("role") === "spinbutton" &&
+        (textInput.getAttribute("data-automation-id") === "dateSectionYear-input" || textInput.getAttribute("aria-label") === "Year");
+      let valueToType = value;
+      if (isYearOnlySpinbutton) {
+        const yearMatch = String(value).match(/\d{4}/);
+        if (yearMatch) {
+          valueToType = yearMatch[0];
+          console.log(`[Tauzand Autofill] year-only spinbutton "${questionTitle}" — extracted "${valueToType}" from "${value}"`);
+        } else {
+          console.warn(`[Tauzand Autofill] year-only spinbutton "${questionTitle}" — couldn't find a 4-digit year in "${value}", flagging for review instead`);
+          flaggedForReview++;
+          highlightForManualReview(textInput, questionTitle);
+          continue;
+        }
+      }
+      await typeIntoField(textInput, valueToType);
       filledCount++;
     }
   }
@@ -689,7 +775,8 @@ async function fillTextFields(container, config, profile) {
 
 // ---------- 5. Scan + fill choice fields (radio / checkbox / dropdown) ----------
 async function fillChoiceFields(container, config, profile) {
-  const blocks = container.querySelectorAll(config.questionSelector);
+  // Same visibility filter as fillTextFields — see the comment there.
+  const blocks = [...container.querySelectorAll(config.questionSelector)].filter(isVisible);
   let filledCount = 0;
   let flaggedForReview = 0;
 
@@ -722,7 +809,15 @@ async function fillChoiceFields(container, config, profile) {
       flaggedForReview++;
       continue;
     }
-    let profileValue = profile[profileKey];
+    // If the flexible multi-entry "education" array is populated, defer
+    // entirely to fillEducationSection() for these fields — see the same
+    // guard in fillTextFields for the full explanation.
+    const EDUCATION_ARRAY_FIELDS_CHOICE = new Set(["school", "degree_type", "field_of_study", "cgpa", "graduation_date", "education_start_year"]);
+    if (EDUCATION_ARRAY_FIELDS_CHOICE.has(profileKey) && profile.education) {
+      flaggedForReview++;
+      continue;
+    }
+    let profileValue = resolveProfileValue(profile, profileKey);
     if (!profileValue) {
       flaggedForReview++; // matched a profile key correctly, but it's empty in Supabase — still needs the user's attention
       continue;
@@ -746,6 +841,7 @@ async function fillChoiceFields(container, config, profile) {
         alreadySelectedTexts.add(match.text);
         filledCount++;
         await sleep(CHOICE_CLICK_DELAY_MS);
+        if (PRIORITY_ONLY_FIELDS.has(profileKey)) break; // e.g. referral_source: first match wins, don't try the rest
       }
     } else if (radioOptions.length) {
       const optionPairs = radioOptions.map((el) => ({ text: optionTextFor(el), element: el }));
@@ -756,7 +852,7 @@ async function fillChoiceFields(container, config, profile) {
         await sleep(CHOICE_CLICK_DELAY_MS);
       }
     } else if (dropdownTriggers.length) {
-      const dropdown = dropdownTriggers[0];
+      let dropdown = dropdownTriggers[0];
       if (dropdown.tagName === "SELECT") {
         const optionPairs = [...dropdown.options].map((opt) => ({ text: opt.textContent, element: opt }));
         console.log(`[Tauzand Autofill] native <select> "${questionTitle}" options:`, optionPairs.map((p) => p.text), "| target value:", profileValue);
@@ -780,35 +876,137 @@ async function fillChoiceFields(container, config, profile) {
         // (not held for the whole run) so Chrome's "debugging this browser"
         // infobar only flashes for a second or two here, instead of staying
         // visible for the entire fill.
-        console.log(`[Tauzand Autofill] opening dropdown for "${questionTitle}", target value: "${profileValue}"`);
+        const cleanedValue = String(profileValue).trim();
+        console.log(`[Tauzand Autofill] opening dropdown for "${questionTitle}", target value: "${cleanedValue}"`);
 
         try {
           await trustedClick(dropdown);
           await sleep(200);
           console.log(`[Tauzand Autofill] dropdown aria-expanded after trusted click:`, dropdown.getAttribute("aria-expanded"));
 
-          // Poll for the options list to finish rendering.
-          let optionElements = [];
-          let previousCount = -1;
-          const pollStart = Date.now();
-          while (Date.now() - pollStart < 1500) {
-            await sleep(120);
-            optionElements = [...document.querySelectorAll("div[role='option']")].filter(isVisible);
-            if (optionElements.length > 0 && optionElements.length === previousCount) break;
-            previousCount = optionElements.length;
+          // Confirmed via inspection: this can be a type-to-search widget
+          // (placeholder="Search") — clicking alone only shows a default/
+          // empty-state set of options, not real filtered results. If a
+          // search input exists inside (or is) the trigger, type into it.
+          function findSearchInput() {
+            if (dropdown.tagName === "INPUT") return dropdown;
+            return dropdown.querySelector("input");
           }
-          console.log(`[Tauzand Autofill] found ${optionElements.length} visible option(s):`, optionElements.map(optionTextFor));
 
-          const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
-          const match = selectMatchingOption(optionPairs, profileValue);
-          console.log(`[Tauzand Autofill] best match for "${profileValue}":`, match ? match.text : "none found");
-          if (match) {
-            await trustedClick(match.element);
-            filledCount++;
+          async function pollForVisibleOptions() {
+            let elements = [];
+            let previousCount = -1;
+            const pollStart = Date.now();
+            while (Date.now() - pollStart < 1500) {
+              await sleep(120);
+              // "[data-automation-id='promptOption']" added alongside
+              // role='option' — confirmed via inspection that Workday's open
+              // dropdown options use this data attribute instead of an ARIA
+              // role.
+              elements = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']")].filter(isVisible);
+              if (elements.length > 0 && elements.length === previousCount) break;
+              previousCount = elements.length;
+            }
+            return elements;
+          }
+
+          async function searchAndPoll(query) {
+            const searchInput = findSearchInput();
+            console.log(`[Tauzand Autofill] search input for "${query}":`, searchInput ? `<${searchInput.tagName} id="${searchInput.id}" placeholder="${searchInput.placeholder}">` : "NONE FOUND (dropdown itself:", dropdown.outerHTML.slice(0, 150) + ")");
+            if (searchInput) {
+              setFieldValue(searchInput, ""); // clear any leftover text from a previous value first
+              await sleep(80);
+              await typeIntoField(searchInput, query);
+              await sleep(200);
+              // Confirmed via testing: Workday's search filter only
+              // properly applies once Enter is pressed — without this, the
+              // "results" shown weren't actually filtered by the typed
+              // query at all (e.g. searching "Software Engineering" was
+              // returning unrelated options like "Aerospace Engineering").
+              searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+              searchInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+              await sleep(300);
+              console.log(`[Tauzand Autofill] search input value after typing "${query}":`, searchInput.value);
+            }
+            const result = await pollForVisibleOptions();
+            console.log(`[Tauzand Autofill] options after searching "${query}":`, result.map(optionTextFor).join(" | "));
+            return result;
+          }
+
+          const isMultiValue = /[,;]/.test(cleanedValue);
+          if (isMultiValue) {
+            // e.g. "Social Media, LinkedIn" — click each match in turn.
+            // Only clicks the dropdown open when no options are currently
+            // visible — checking dropdown.getAttribute("aria-expanded")
+            // instead was unreliable here (confirmed via testing: it's
+            // always null on this widget, so that check always forced a
+            // redundant re-click, which toggled an already-open menu
+            // closed right when searching for the next value, making every
+            // value after the first fail to find any options at all).
+            const values = cleanedValue.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+            let selectedAny = false;
+            for (const val of values) {
+              // Re-fetch fresh each time — confirmed via testing that after
+              // selecting one match, the widget re-renders and detaches the
+              // old dropdown/input reference, so reusing it for later
+              // values silently types into a disconnected element.
+              const freshDropdown = block.querySelector(config.selectSelector);
+              if (freshDropdown) dropdown = freshDropdown;
+
+              // Always click before searching — confirmed via testing that
+              // checking "are options already visible" first gives a false
+              // positive once one value has been selected: the selected
+              // item's own chip/pill element also matches the generic
+              // option selector, so the check thought the menu was already
+              // open and skipped reopening it.
+              //
+              // Click the promptIcon (the chevron toggle) specifically —
+              // confirmed via testing that clicking the input directly, and
+              // separately clicking the outer wrapper, both failed
+              // identically (every search after the first kept returning
+              // only the already-selected item's own chip, never real
+              // results). This suggests the widget's "open/reopen the
+              // dropdown" logic isn't bound to focusing the input at all —
+              // promptIcon is a distinct toggle element present in this
+              // same widget pattern elsewhere (e.g. Degree's caret-down).
+              const promptIcon = dropdown.querySelector('[data-automation-id="promptIcon"]') || block.querySelector('[data-automation-id="promptIcon"]');
+              const searchInputForClick = findSearchInput();
+              const clickTarget = promptIcon || searchInputForClick || dropdown;
+              console.log(`[Tauzand Autofill] clicking for "${val}":`, promptIcon ? "promptIcon" : searchInputForClick ? "search input" : "dropdown wrapper");
+              await trustedClick(clickTarget);
+              await sleep(200);
+              if (searchInputForClick) searchInputForClick.focus();
+              const currentOptions = await searchAndPoll(val);
+              const currentPairs = currentOptions.map((el) => ({ text: optionTextFor(el), element: el }));
+              const currentMatch = selectMatchingOption(currentPairs, val);
+              console.log(`[Tauzand Autofill] multi-value match for "${val}" (${currentOptions.length} option(s): ${currentPairs.map((p) => p.text).join(" | ")}):`, currentMatch ? currentMatch.text : "none found");
+              if (currentMatch) {
+                await trustedClick(currentMatch.element);
+                selectedAny = true;
+                filledCount++;
+                await sleep(CHOICE_CLICK_DELAY_MS);
+                if (PRIORITY_ONLY_FIELDS.has(profileKey)) break; // e.g. referral_source: first match wins, don't try the rest
+              }
+            }
+            if (!selectedAny) {
+              highlightForManualReview(dropdown, questionTitle);
+              flaggedForReview++;
+            }
           } else {
-            await trustedClick(document.body); // close the dropdown again so it isn't left open
-            highlightForManualReview(dropdown, questionTitle);
-            flaggedForReview++;
+            const optionElements = await searchAndPoll(cleanedValue);
+            console.log(`[Tauzand Autofill] found ${optionElements.length} visible option(s):`, optionElements.map(optionTextFor));
+
+            const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
+            const match = selectMatchingOption(optionPairs, cleanedValue);
+            console.log(`[Tauzand Autofill] best match for "${cleanedValue}":`, match ? match.text : "none found");
+            if (match) {
+              await trustedClick(match.element);
+              filledCount++;
+            } else {
+              await trustedClick(document.body); // close the dropdown again so it isn't left open
+              highlightForManualReview(dropdown, questionTitle);
+              flaggedForReview++;
+            }
           }
         } catch (err) {
           // Trusted-click service unavailable for some reason (debugger
@@ -827,6 +1025,299 @@ async function fillChoiceFields(container, config, profile) {
 }
 
 // ---------- 6. Orchestration ----------
+// ---------- 6. Work Experience (repeatable section) ----------
+// Confirmed via live DOM inspection (Workday): each entry's fields carry a
+// stable data-automation-id (formField-jobTitle, formField-companyName,
+// formField-location, formField-currentlyWorkHere, formField-startDate,
+// formField-endDate, formField-roleDescription) that's unique to this
+// section — Education's date fields use different automation-ids
+// (formField-firstYearAttended / formField-lastYearAttended), so there's no
+// risk of cross-matching between the two sections the way there would be
+// with generic text-label hints (both sections show a bare "From"/"To"
+// label). This lets us skip fuzzy hint-matching entirely for this section
+// and query directly instead.
+// Gets the panel at position `index` (0-based) within a repeatable section,
+// clicking the section's "Add" button first ONLY if that panel doesn't
+// already exist. Handles both cases seen across different Workday tenants:
+// some show "Entry 1" by default with no Add needed, others start
+// completely empty and need Add clicked even for the first entry.
+async function getOrCreatePanel(section, panelSelector, addButtonSelector, index) {
+  let panels = section.querySelectorAll(panelSelector);
+  if (panels.length > index) return panels[index]; // already exists — no click needed
+
+  const addButton = section.querySelector(addButtonSelector);
+  if (!addButton) return null;
+  addButton.click();
+
+  // Poll instead of a fixed wait — confirmed via testing that the first
+  // "Add" click can take noticeably longer than later ones to render the
+  // new panel.
+  const pollStart = Date.now();
+  while (panels.length <= index && Date.now() - pollStart < 2500) {
+    await sleep(150);
+    panels = section.querySelectorAll(panelSelector);
+  }
+  return panels.length > index ? panels[index] : null;
+}
+
+async function fillEducationSection(profile) {
+  let entries = profile.education;
+  console.log("[Tauzand Autofill] profile.education raw value:", entries, "| type:", typeof entries, "| is array:", Array.isArray(entries));
+  if (typeof entries === "string") {
+    try {
+      entries = JSON.parse(entries);
+      console.log("[Tauzand Autofill] parsed education string into:", entries);
+    } catch (err) {
+      console.warn("[Tauzand Autofill] education was a string but not valid JSON:", err);
+      entries = null;
+    }
+  }
+  if (!Array.isArray(entries) || entries.length === 0) {
+    console.log("[Tauzand Autofill] no education entries to fill — skipping this section");
+    return { filledCount: 0, flaggedForReview: 0 };
+  }
+
+  const section = document.querySelector('[aria-labelledby="Education-section"]');
+  if (!section) {
+    console.log("[Tauzand Autofill] no Education section found on this page — skipping");
+    return { filledCount: 0, flaggedForReview: 0 };
+  }
+
+  let filledCount = 0;
+  let flaggedForReview = 0;
+  const panelSelector = '[aria-labelledby^="Education-"][aria-labelledby$="-panel"]';
+
+  async function pollOptions() {
+    let options = [];
+    let previousCount = -1;
+    const pollStart = Date.now();
+    while (Date.now() - pollStart < 1500) {
+      await sleep(150);
+      options = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']")].filter(isVisible);
+      if (options.length > 0 && options.length === previousCount) break;
+      previousCount = options.length;
+    }
+    return options;
+  }
+
+  // School and Field of Study are search-type comboboxes — same widget as
+  // the platform-wide "Field of Study"/"How Did You Hear" pattern, so this
+  // reuses the same type + Enter + poll + match approach proven working
+  // there.
+  async function fillSearchCombobox(panel, fieldName, value) {
+    if (!value) return false;
+    const wrapper = panel.querySelector(`[data-automation-id="formField-${fieldName}"]`);
+    if (!wrapper) {
+      console.warn(`[Tauzand Autofill] Education field "${fieldName}" not found in panel`);
+      return false;
+    }
+    const input = wrapper.querySelector("input");
+    if (!input) return false;
+    await trustedClick(input);
+    await sleep(200);
+    setFieldValue(input, "");
+    await sleep(80);
+    await typeIntoField(input, value);
+    await sleep(200);
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+    await sleep(300);
+
+    const options = await pollOptions();
+    if (options.length === 0) return false;
+    const pairs = options.map((el) => ({ text: optionTextFor(el), element: el }));
+    const match = selectMatchingOption(pairs, value);
+    if (!match) return false;
+    await trustedClick(match.element);
+    return true;
+  }
+
+  // Degree is a button that opens a listbox.
+  async function fillDegreeButton(panel, value) {
+    if (!value) return false;
+    const wrapper = panel.querySelector('[data-automation-id="formField-degree"]');
+    if (!wrapper) return false;
+    const button = wrapper.querySelector("button[aria-haspopup='listbox']");
+    if (!button) return false;
+    await trustedClick(button);
+    await sleep(300);
+    const options = await pollOptions();
+    if (options.length === 0) return false;
+    const pairs = options.map((el) => ({ text: optionTextFor(el), element: el }));
+    const match = selectMatchingOption(pairs, value);
+    if (!match) return false;
+    await trustedClick(match.element);
+    return true;
+  }
+
+  const fillYear = (panel, fieldName, yearStr) => {
+    if (!yearStr) return false;
+    const yearMatch = String(yearStr).match(/\d{4}/);
+    if (!yearMatch) return false;
+    const wrapper = panel.querySelector(`[data-automation-id="formField-${fieldName}"]`);
+    if (!wrapper) return false;
+    const yearInput = wrapper.querySelector('[data-automation-id="dateSectionYear-input"]');
+    if (!yearInput) return false;
+    setFieldValue(yearInput, yearMatch[0]);
+    return true;
+  };
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const newPanel = await getOrCreatePanel(section, panelSelector, '[data-automation-id="add-button"]', i);
+    if (!newPanel) {
+      console.warn(`[Tauzand Autofill] Education entry ${i + 1} panel not found/created — skipping`);
+      flaggedForReview++;
+      continue;
+    }
+    console.log("[Tauzand Autofill] filling Education entry:", entry.school || "(no school)", "-", entry.degree || "(no degree)");
+
+    if (await fillSearchCombobox(newPanel, "school", entry.school)) filledCount++;
+    else flaggedForReview++;
+
+    if (await fillDegreeButton(newPanel, entry.degree)) filledCount++;
+    else flaggedForReview++;
+
+    if (entry.field_of_study) {
+      if (await fillSearchCombobox(newPanel, "fieldOfStudy", entry.field_of_study)) filledCount++;
+    }
+
+    if (fillYear(newPanel, "firstYearAttended", entry.start_year)) filledCount++;
+    if (fillYear(newPanel, "lastYearAttended", entry.end_year)) filledCount++;
+
+    if (entry.cgpa) {
+      // Automation-id for this field wasn't confirmed via inspection —
+      // try a couple of reasonable guesses, then fall back to a text
+      // search within the panel for a "GPA"/"overall result" label.
+      let cgpaField = newPanel.querySelector(
+        '[data-automation-id="formField-cgpa"] input, [data-automation-id="formField-gpa"] input, [data-automation-id="formField-overallResult"] input'
+      );
+      if (!cgpaField) {
+        const candidates = [...newPanel.querySelectorAll('[data-automation-id^="formField-"]')];
+        const cgpaWrapper = candidates.find((el) => /gpa|overall result/i.test(el.textContent));
+        cgpaField = cgpaWrapper ? cgpaWrapper.querySelector("input") : null;
+      }
+      if (cgpaField) {
+        setFieldValue(cgpaField, entry.cgpa);
+        filledCount++;
+      } else {
+        console.warn("[Tauzand Autofill] couldn't find a CGPA field in this Education panel — automation-id may differ, needs live inspection");
+        flaggedForReview++;
+      }
+    }
+
+    await sleep(CHOICE_CLICK_DELAY_MS);
+  }
+
+  return { filledCount, flaggedForReview };
+}
+
+async function fillWorkExperienceSection(profile) {
+  let entries = profile.work_experience;
+  console.log("[Tauzand Autofill] profile.work_experience raw value:", entries, "| type:", typeof entries, "| is array:", Array.isArray(entries));
+  // Confirmed via testing: this comes through as a JSON string, not an
+  // already-parsed array (the backend/Supabase client isn't auto-parsing
+  // the JSONB column) — parse it defensively here regardless of the exact
+  // upstream cause.
+  if (typeof entries === "string") {
+    try {
+      entries = JSON.parse(entries);
+      console.log("[Tauzand Autofill] parsed work_experience string into:", entries);
+    } catch (err) {
+      console.warn("[Tauzand Autofill] work_experience was a string but not valid JSON:", err);
+      entries = null;
+    }
+  }
+  if (!Array.isArray(entries) || entries.length === 0) {
+    console.log("[Tauzand Autofill] no work experience entries to fill — skipping this section");
+    return { filledCount: 0, flaggedForReview: 0 };
+  }
+
+  const section = document.querySelector('[aria-labelledby="Work-Experience-section"]');
+  if (!section) {
+    console.log("[Tauzand Autofill] no Work Experience section found on this page — skipping");
+    return { filledCount: 0, flaggedForReview: 0 };
+  }
+
+  let filledCount = 0;
+  let flaggedForReview = 0;
+
+  const panelSelector = '[aria-labelledby^="Work-Experience-"][aria-labelledby$="-panel"]';
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const newPanel = await getOrCreatePanel(section, panelSelector, '[data-automation-id="add-button"]', i);
+    if (!newPanel) {
+      console.warn(`[Tauzand Autofill] Work Experience entry ${i + 1} panel not found/created — skipping`);
+      flaggedForReview++;
+      continue;
+    }
+    console.log("[Tauzand Autofill] filling Work Experience entry:", entry.job_title || "(no title)", "at", entry.company || "(no company)");
+
+    const fillByAutomationId = (fieldName, value) => {
+      if (!value) return false;
+      const field = newPanel.querySelector(`[data-automation-id="formField-${fieldName}"] input, [data-automation-id="formField-${fieldName}"] textarea`);
+      if (!field) {
+        console.warn(`[Tauzand Autofill] Work Experience field "${fieldName}" not found in new panel`);
+        return false;
+      }
+      setFieldValue(field, value);
+      return true;
+    };
+
+    if (fillByAutomationId("jobTitle", entry.job_title)) filledCount++;
+    else flaggedForReview++;
+    if (fillByAutomationId("companyName", entry.company)) filledCount++;
+    else flaggedForReview++;
+    if (entry.location && fillByAutomationId("location", entry.location)) filledCount++;
+    if (entry.description && fillByAutomationId("roleDescription", entry.description)) filledCount++;
+
+    const checkbox = newPanel.querySelector('[data-automation-id="formField-currentlyWorkHere"] input[type="checkbox"]');
+    if (checkbox && entry.is_current && !checkbox.checked) {
+      checkbox.click();
+      await sleep(150);
+      filledCount++;
+    }
+
+    // Each date field splits into separate Month/Year spinbutton inputs —
+    // "MM/YYYY" in the profile value needs to be split apart to fill both.
+    const fillDate = (fieldName, dateStr) => {
+      if (!dateStr) return false;
+      const parts = String(dateStr).split("/").map((s) => s.trim());
+      if (parts.length !== 2) {
+        console.warn(`[Tauzand Autofill] Work Experience date "${dateStr}" for "${fieldName}" isn't in MM/YYYY format — skipping`);
+        return false;
+      }
+      const [month, year] = parts;
+      const wrapper = newPanel.querySelector(`[data-automation-id="formField-${fieldName}"]`);
+      if (!wrapper) return false;
+      const monthInput = wrapper.querySelector('[data-automation-id="dateSectionMonth-input"]');
+      const yearInput = wrapper.querySelector('[data-automation-id="dateSectionYear-input"]');
+      let didFill = false;
+      if (monthInput) {
+        setFieldValue(monthInput, month.padStart(2, "0"));
+        didFill = true;
+      }
+      if (yearInput) {
+        setFieldValue(yearInput, year);
+        didFill = true;
+      }
+      return didFill;
+    };
+
+    if (fillDate("startDate", entry.start_date)) filledCount++;
+    else flaggedForReview++;
+    if (!entry.is_current) {
+      if (fillDate("endDate", entry.end_date)) filledCount++;
+      else flaggedForReview++;
+    }
+
+    await sleep(CHOICE_CLICK_DELAY_MS);
+  }
+
+  return { filledCount, flaggedForReview };
+}
+
 async function runAutofill(profileId) {
   showToast("Fetching your profile...");
   let profile;
@@ -879,8 +1370,14 @@ async function runAutofill(profileId) {
 
     const { filledCount: choiceFilledCount, flaggedForReview: choiceFlaggedForReview } = await fillChoiceFields(document, config, profile);
 
-    const totalFilled = textFilledCount + choiceFilledCount;
-    const totalFlagged = textFlaggedForReview + choiceFlaggedForReview;
+    showToast("Filling education...");
+    const { filledCount: eduFilledCount, flaggedForReview: eduFlaggedForReview } = await fillEducationSection(profile);
+
+    showToast("Filling work experience...");
+    const { filledCount: workExpFilledCount, flaggedForReview: workExpFlaggedForReview } = await fillWorkExperienceSection(profile);
+
+    const totalFilled = textFilledCount + choiceFilledCount + eduFilledCount + workExpFilledCount;
+    const totalFlagged = textFlaggedForReview + choiceFlaggedForReview + eduFlaggedForReview + workExpFlaggedForReview;
     showToast(
       totalFlagged > 0
         ? `\u2705 Filled ${totalFilled} fields — ${totalFlagged} left for you to review`
