@@ -7,8 +7,8 @@ surface is easy to restandardize in Phase 2.
 import time
 import uuid
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Flask, request, jsonify  # type: ignore[import]
+from flask_cors import CORS  # type: ignore[import]
 
 from config import Config
 from services import supabase_client, form_filler, resume_service, mistral_client
@@ -180,6 +180,83 @@ def close_session(driver_id):
     if not closed:
         return jsonify({"success": False, "error": "Unknown or already-closed driver_id"}), 404
     return jsonify({"success": True})
+
+
+@app.post("/api/llm/suggest-answer")
+def suggest_answer():
+    """
+    Body: { "question": "...", "profile": {...} }
+    Powers the extension's "AI Suggest" button on long-answer (textarea)
+    questions the confidence-matcher can't handle (e.g. "Best project you
+    worked on", "Expected CTC"). Uses the candidate's profile as context so
+    the draft references their real background instead of being generic —
+    the extension always shows this as an editable draft, never auto-fills
+    it, so a slightly-off suggestion is a minor inconvenience, not a
+    correctness risk the way silently submitting one would be.
+    """
+    payload = request.get_json(force=True)
+    question = (payload.get("question") or "").strip()
+    profile = payload.get("profile") or {}
+    if not question:
+        return jsonify({"success": False, "error": "question is required"}), 400
+    if not Config.MISTRAL_API_KEY:
+        return jsonify({"success": False, "error": "Mistral API key not configured on the backend"}), 500
+
+    # Compact, relevant-only summary — sending the whole profile blob would
+    # waste tokens on fields (phone number, address, etc.) that have nothing
+    # to do with writing a recruiter-facing answer.
+    summary_lines = []
+    if profile.get("full_name"):
+        summary_lines.append(f"Name: {profile['full_name']}")
+    if profile.get("skills"):
+        summary_lines.append(f"Skills: {profile['skills']}")
+    if profile.get("school") or profile.get("degree_type") or profile.get("field_of_study"):
+        summary_lines.append(
+            f"Education: {profile.get('degree_type', '')} in {profile.get('field_of_study', '')} "
+            f"at {profile.get('school', '')}".strip()
+        )
+    if profile.get("education"):
+        summary_lines.append(f"Education history: {profile['education']}")
+    if profile.get("work_experience"):
+        summary_lines.append(f"Work experience: {profile['work_experience']}")
+    profile_summary = "\n".join(summary_lines) or "No additional profile details available — write a reasonable general answer."
+
+    system_prompt = (
+        "You are helping a job applicant answer a job application question. Write a short, "
+        "professional, recruiter-friendly answer using the candidate's real background where "
+        "relevant — never invent facts not present in their profile. Keep it confident but "
+        "honest, concise (3-5 sentences unless the question clearly calls for more, e.g. a "
+        "single number for something like expected salary), and free of generic filler "
+        "phrases. Output ONLY the answer text — no greeting, no sign-off, no explanation of "
+        "what you did."
+    )
+    user_prompt = f"Question: {question}\n\nCandidate background:\n{profile_summary}\n\nWrite the answer."
+
+    try:
+        import requests
+        response = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {Config.MISTRAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "mistral-small-latest",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.6,
+                "max_tokens": 400,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        result = response.json()
+        suggestion = result["choices"][0]["message"]["content"].strip()
+        return jsonify({"success": True, "suggestion": suggestion})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
 
 
 @app.get("/api/platforms")

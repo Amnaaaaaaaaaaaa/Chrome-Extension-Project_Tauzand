@@ -13,9 +13,41 @@ const MIN_TEXT_FIELD_CONFIDENCE = 0.75; // mirrors fill_fields()'s default in fo
 
 // ---------- 1. Platform detection ----------
 const platformKey = detectPlatform(window.location.hostname);
-console.log("[Tauzand Autofill] content script loaded on:", window.location.href, "| detected platform:", platformKey);
+console.log("[Tauzand Autofill] content script loaded on:", window.location.href, "| detected platform:", platformKey, "| top frame:", window.self === window.top);
 if (platformKey) {
-  initAutofill();
+  const hasIframes = document.querySelectorAll("iframe").length > 0;
+  if (!hasIframes) {
+    // The common case — no iframes on this page at all, so there's no
+    // ambiguity about which frame should show the banner. Show it
+    // immediately, same as the original behavior, instead of waiting.
+    initAutofill();
+  } else {
+    // This page has at least one iframe — the actual form content could be
+    // in the top frame, in an iframe, or (rarely) both, so poll for real
+    // fields in THIS frame before deciding whether to show a banner here.
+    // Confirmed via testing that this is genuinely needed on some pages
+    // (Ashby's careers-page embed) and that render timing varies a lot —
+    // some pages load several slow third-party scripts (gsap, FullStory,
+    // Clearbit) that delay the real form's React render by several seconds.
+    (async () => {
+      const config = PLATFORM_SELECTORS[platformKey];
+      let hasAnyFields = false;
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < 6000) {
+        if (config && document.querySelectorAll(config.questionSelector).length > 0) {
+          hasAnyFields = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      if (hasAnyFields) {
+        console.log("[Tauzand Autofill] real fields found in this frame — showing banner here");
+        initAutofill();
+      } else {
+        console.log("[Tauzand Autofill] no matching fields in this frame after waiting — skipping banner here");
+      }
+    })();
+  }
 }
 
 // Lets the popup's "Fill This Form Now" button trigger a fill on demand,
@@ -675,6 +707,143 @@ async function checkForLoginWall() {
 }
 
 // ---------- 4. Scan + fill text fields ----------
+// ---------- 3b. AI Suggest for long-answer (textarea) fields ----------
+// Per instructions: for long-answer questions the confidence-matching
+// system was never going to handle (e.g. "Best project you worked on",
+// "Expected CTC"), offer an AI-drafted answer instead of leaving the field
+// blank — but always require the user to review/edit and explicitly click
+// Insert. Nothing from this path is ever auto-filled.
+function addAiSuggestButton(textareaEl, questionTitle, profile) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "\u2728 AI Suggest";
+  btn.dataset.tauzandAiButton = "true";
+  Object.assign(btn.style, {
+    display: "inline-block",
+    marginTop: "6px",
+    padding: "5px 12px",
+    fontSize: "12px",
+    fontWeight: "600",
+    fontFamily: "system-ui, sans-serif",
+    background: "#1F4E79",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+
+  btn.addEventListener("click", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const originalLabel = btn.textContent;
+    btn.textContent = "Thinking...";
+    btn.disabled = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "LLM_SUGGEST",
+        question: questionTitle,
+        profile,
+      });
+      if (response && response.success) {
+        showSuggestionPopup(textareaEl, btn, response.suggestion);
+      } else {
+        alert(`Couldn't get an AI suggestion: ${(response && response.error) || "unknown error"}`);
+      }
+    } catch (err) {
+      console.error("[Tauzand Autofill] AI suggest failed:", err);
+      alert("Couldn't reach the backend for an AI suggestion — check it's running.");
+    } finally {
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+    }
+  });
+
+  textareaEl.insertAdjacentElement("afterend", btn);
+}
+
+function showSuggestionPopup(textareaEl, anchorBtn, suggestion) {
+  const existing = document.getElementById("tauzand-ai-suggestion-popup");
+  if (existing) existing.remove();
+
+  const popup = document.createElement("div");
+  popup.id = "tauzand-ai-suggestion-popup";
+  Object.assign(popup.style, {
+    marginTop: "8px",
+    padding: "12px",
+    background: "#F0F6FF",
+    border: "2px solid #1F4E79",
+    borderRadius: "8px",
+    fontFamily: "system-ui, sans-serif",
+  });
+
+  const label = document.createElement("div");
+  label.textContent = "AI suggestion — edit as needed, then click Insert:";
+  Object.assign(label.style, { fontSize: "12px", fontWeight: "600", marginBottom: "6px", color: "#1F4E79" });
+  popup.appendChild(label);
+
+  const editArea = document.createElement("textarea");
+  editArea.value = suggestion;
+  Object.assign(editArea.style, {
+    width: "100%",
+    minHeight: "110px",
+    fontFamily: "inherit",
+    fontSize: "13px",
+    padding: "8px",
+    borderRadius: "6px",
+    border: "1px solid #ccc",
+    boxSizing: "border-box",
+  });
+  popup.appendChild(editArea);
+
+  const btnRow = document.createElement("div");
+  Object.assign(btnRow.style, { marginTop: "8px", display: "flex", gap: "8px" });
+
+  const insertBtn = document.createElement("button");
+  insertBtn.type = "button";
+  insertBtn.textContent = "Insert";
+  Object.assign(insertBtn.style, {
+    padding: "6px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    background: "#1F4E79",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  insertBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setFieldValue(textareaEl, editArea.value);
+    popup.remove();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  Object.assign(cancelBtn.style, {
+    padding: "6px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    background: "#ffffff",
+    color: "#1F4E79",
+    border: "1px solid #1F4E79",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  cancelBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    popup.remove();
+  });
+
+  btnRow.appendChild(insertBtn);
+  btnRow.appendChild(cancelBtn);
+  popup.appendChild(btnRow);
+
+  (anchorBtn || textareaEl).insertAdjacentElement("afterend", popup);
+}
+
 async function fillTextFields(container, config, profile) {
   // Filtered to only currently-visible blocks — confirmed necessary on
   // Workday: its multi-page apply flow (My Information -> My Experience ->
@@ -716,6 +885,13 @@ async function fillTextFields(container, config, profile) {
     console.log(`[Tauzand Autofill] text question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${MIN_TEXT_FIELD_CONFIDENCE})`);
     if (score < MIN_TEXT_FIELD_CONFIDENCE) {
       flaggedForReview++; // real text field, but couldn't confidently match it to a profile key
+      // Long-answer questions (e.g. "Best project you worked on",
+      // "Expected CTC") never match our fixed profile-field hints — offer
+      // an AI-drafted answer instead of just leaving it blank. Scoped to
+      // <textarea> only, per instructions.
+      if (textInput.tagName === "TEXTAREA") {
+        addAiSuggestButton(textInput, questionTitle, profile);
+      }
       continue;
     }
     // "from" is a bare, generic hint (shared by Education's "From" field
@@ -734,7 +910,8 @@ async function fillTextFields(container, config, profile) {
     // generic flat-field scan also touch the same Education panel risks
     // conflicting/duplicate fills (e.g. opening the same dropdown twice).
     const EDUCATION_ARRAY_FIELDS = new Set(["school", "degree_type", "field_of_study", "cgpa", "graduation_date", "education_start_year"]);
-    if (EDUCATION_ARRAY_FIELDS.has(profileKey) && profile.education) {
+    const hasWorkdayEducationSection = !!document.querySelector('[aria-labelledby="Education-section"]');
+    if (EDUCATION_ARRAY_FIELDS.has(profileKey) && profile.education && hasWorkdayEducationSection) {
       flaggedForReview++;
       continue;
     }
@@ -849,7 +1026,8 @@ async function fillChoiceFields(container, config, profile) {
     // entirely to fillEducationSection() for these fields — see the same
     // guard in fillTextFields for the full explanation.
     const EDUCATION_ARRAY_FIELDS_CHOICE = new Set(["school", "degree_type", "field_of_study", "cgpa", "graduation_date", "education_start_year"]);
-    if (EDUCATION_ARRAY_FIELDS_CHOICE.has(profileKey) && profile.education) {
+    const hasWorkdayEducationSectionChoice = !!document.querySelector('[aria-labelledby="Education-section"]');
+    if (EDUCATION_ARRAY_FIELDS_CHOICE.has(profileKey) && profile.education && hasWorkdayEducationSectionChoice) {
       flaggedForReview++;
       continue;
     }

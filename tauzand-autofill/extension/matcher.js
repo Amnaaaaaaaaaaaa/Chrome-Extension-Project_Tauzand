@@ -124,6 +124,14 @@ function selectMatchingOption(optionPairs, targetValue, minRatio = 0.55) {
   const targetLower = String(targetValue).trim().toLowerCase();
   if (!targetLower) return null;
   const targetNormalized = normalizeForMatch(targetLower);
+  // Confirmed via testing: stripping punctuation can reduce a short
+  // technical term (e.g. "C++") down to almost nothing (just "c"), which
+  // then appears as a substring in tons of unrelated words and wins the
+  // coverage bonus incorrectly (e.g. "TypeScript" matching "C++" because
+  // "typescript" contains the letter "c"). Only trust the normalized
+  // comparison when both sides are long enough for a substring match to
+  // actually mean something.
+  const MIN_NORMALIZED_LEN_FOR_COVERAGE = 3;
 
   let bestPair = null;
   let bestScore = 0.0;
@@ -134,12 +142,14 @@ function selectMatchingOption(optionPairs, targetValue, minRatio = 0.55) {
     const optionNormalized = normalizeForMatch(optionLower);
 
     let score = Math.max(similarityRatio(optionLower, targetLower), similarityRatio(optionNormalized, targetNormalized));
+    const normalizedCoverageEligible =
+      optionNormalized.length >= MIN_NORMALIZED_LEN_FOR_COVERAGE && targetNormalized.length >= MIN_NORMALIZED_LEN_FOR_COVERAGE;
     if (
       optionLower.includes(targetLower) || targetLower.includes(optionLower) ||
-      optionNormalized.includes(targetNormalized) || targetNormalized.includes(optionNormalized)
+      (normalizedCoverageEligible && (optionNormalized.includes(targetNormalized) || targetNormalized.includes(optionNormalized)))
     ) {
-      const shorterLen = Math.min(optionNormalized.length, targetNormalized.length);
-      const longerLen = Math.max(optionNormalized.length, targetNormalized.length, 1);
+      const shorterLen = Math.min(optionLower.length, targetLower.length);
+      const longerLen = Math.max(optionLower.length, targetLower.length, 1);
       const coverageBonus = 0.25 * (shorterLen / longerLen);
       score = Math.max(score, 0.70 + coverageBonus);
     }

@@ -24,7 +24,6 @@ from selenium.common.exceptions import (  # type: ignore[import-not-found]
     TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException,
 )
 
-
 from config import Config
 from services import platform_configs
 from services.captcha_detector import run_all_checks
@@ -293,6 +292,13 @@ def _select_matching_option(option_pairs: list[tuple[str, object]], target_value
 
     best_pair, best_score = None, 0.0
     target_normalized = _normalize_for_match(target_lower)
+    # Confirmed via testing: stripping punctuation can reduce a short
+    # technical term (e.g. "C++") down to almost nothing (just "c"), which
+    # then appears as a substring in tons of unrelated words and wins the
+    # coverage bonus incorrectly. Only trust the normalized comparison when
+    # both sides are long enough for a substring match to actually mean
+    # something.
+    MIN_NORMALIZED_LEN_FOR_COVERAGE = 3
     for option_text, option_element in option_pairs:
         option_lower = option_text.strip().lower()
         if not option_lower:
@@ -302,12 +308,16 @@ def _select_matching_option(option_pairs: list[tuple[str, object]], target_value
             SequenceMatcher(None, option_lower, target_lower).ratio(),
             SequenceMatcher(None, option_normalized, target_normalized).ratio(),
         )
+        normalized_coverage_eligible = (
+            len(option_normalized) >= MIN_NORMALIZED_LEN_FOR_COVERAGE
+            and len(target_normalized) >= MIN_NORMALIZED_LEN_FOR_COVERAGE
+        )
         if (
             option_lower in target_lower or target_lower in option_lower
-            or option_normalized in target_normalized or target_normalized in option_normalized
+            or (normalized_coverage_eligible and (option_normalized in target_normalized or target_normalized in option_normalized))
         ):
-            shorter_len = min(len(option_normalized), len(target_normalized))
-            longer_len = max(len(option_normalized), len(target_normalized), 1)
+            shorter_len = min(len(option_lower), len(target_lower))
+            longer_len = max(len(option_lower), len(target_lower), 1)
             coverage_bonus = 0.25 * (shorter_len / longer_len)
             score = max(score, 0.70 + coverage_bonus)
         if score > best_score:
