@@ -114,6 +114,9 @@ See `schema_update.sql` for the full, commented list. Grouped by purpose:
 - **Referral/EEO:** `referral_source` (priority-only — see §7.3), `gender`, `race`,
   `veteran_status`, `disability_status` — added per explicit instruction, since these are
   normally left manual by default
+- **Compliance/screening questions:** `non_compete_restrictions`, `us_government_employee`,
+  `export_control_restricted_country` — plain "Yes"/"No" fields for common Workday compliance
+  questionnaire items
 - **Misc:** `current_company`, `date_of_birth`, `willing_to_relocate`
 
 ---
@@ -173,6 +176,41 @@ earlier steps' fields stay in the DOM but hidden rather than being removed. Two 
 - The banner is a permanent watchdog (recreated every second if missing from the DOM) so it
   survives whatever internal re-navigation Workday does between steps.
 
+### 6.8 Trusted keyboard input (`chrome.debugger`, extended to typing)
+Workday's date-spinbutton fields (Month/Day/Year) still showed "Invalid Date" even after
+setting `.value` correctly via the React-safe native setter *and* dispatching `input`,
+`change`, and `blur` — the validation logic needed genuinely trusted keystrokes, the same
+`isTrusted` boundary that motivated trusted clicks (§6.1). `background.js` extends the CDP
+service with `Input.dispatchKeyEvent`, sending real `keyDown`/`keyUp` pairs character by
+character, with a short (~60ms) pause between characters — dispatching them back-to-back with
+no gap caused corrupted values (e.g. "06" became "00"), apparently from event-queue collisions
+on Workday's side.
+
+### 6.9 Question titles aren't always `<label>`
+Several Workday and Greenhouse questions title themselves with `<legend>` (Greenhouse's
+`fieldset.checkbox`/`fieldset.radio`, and Workday questionnaire items like "Would you consider
+relocating") instead of `<label>` — `questionTitleSelector` includes both, per platform, or a
+block's title comes back empty and the whole question is silently skipped. Workday also has
+free-text answers that use `<textarea>` rather than `<input>` (e.g. "Please enter your name"
+signature fields) — `textInputSelector` includes `textarea` for the same reason.
+
+### 6.10 Selected-item chips can share the same attributes as real options
+Beyond the `role="option"` collision already noted in §7.5, Workday's chip *label* element
+(the `<p>`/`<div>` showing the already-selected value, e.g. "JavaScript, press delete to
+clear") also carries `data-automation-id="promptOption"` — the same attribute used for real,
+selectable dropdown options — and often has **no `id` at all**, so a `:not([id^='pill-'])` CSS
+exclusion alone doesn't catch it. The option-collection step also filters out anything that is
+a *descendant* of a `[id^='pill-']` container via `.closest()`, which catches the chip's inner
+label regardless of whether the label itself has an id.
+
+### 6.11 Automation-id overrides for generically-titled questions
+A small number of questions have a title too generic for any hint list to match confidently —
+Workday's disability self-identification question is literally titled "Please check one of the
+boxes below:" with no mention of "disability" anywhere in the visible text. For these, the
+block's own `data-automation-id`/`id` (e.g. `disabilityStatus-CheckboxGroup`) is used as a
+direct override to the matched profile key, bypassing the fuzzy title-matching path entirely
+rather than trying to expand the hint list to cover an unrelated generic phrase.
+
 ---
 
 ## 7. Platform-specific notes
@@ -212,11 +250,16 @@ The most complex platform, for several reasons:
 - **Selected-item chips also carry `role="option"`**, identical to real dropdown options —
   the option-query selector explicitly excludes anything with an `id` starting `pill-`
   (`[role='option']:not([id^='pill-'])`) to avoid matching an already-selected chip instead of
-  a real, unselected option.
+  a real, unselected option. See §6.10 for the chip *label* variant of this same problem.
+- **Date-section fields (Month/Day/Year) need trusted keystrokes**, not just a correct
+  `.value` — see §6.8. `fillDateSectionInput()` handles this for all three of Workday's date
+  contexts: Education's Year-only fields, Work Experience's Month+Year fields, and signature
+  "today's date" fields (Month+Day+Year).
 - **Year-only spinbutton fields** (Education's From/To) need just the 4-digit year extracted
   from the profile value, not the full date string — a bare `role="spinbutton"` input with
   `aria-label="Year"` or `data-automation-id="dateSectionYear-input"` gets this treatment
   automatically.
+- **Not every question title is a `<label>`** — see §6.9.
 - **Repeatable sections (Education, Work Experience)** have their own dedicated functions
   (`fillEducationSection()`, `fillWorkExperienceSection()`), not the generic scan-and-fill
   pipeline, because they need to click "Add"/"Add Another" once per profile entry and target
@@ -251,9 +294,29 @@ profile summary (skills, education, work experience). Mistral generates a draft;
 sees it in an editable popup and must explicitly click **Insert** — nothing is ever
 auto-filled from this path.
 
-### 8.2 Legal-section validation
-Not yet built. Planned: analyze free-text the candidate writes (or drafts via §8.1) for
-legally risky phrasing and suggest safer alternatives, using the same Mistral-backend pattern.
+### 8.2 Legal-risk check (legal-sensitive free-text questions)
+For `<textarea>` fields whose title matches a legal-sensitive keyword (`LEGAL_TEXT_KEYWORDS`
+in `matcher.js` — "conviction", "lawsuit", "explain any", "non-compete", etc.), a
+"⚖️ Check for legal risk" button appears whenever the candidate has already typed something
+into the field. Clicking it calls `POST /api/llm/validate-legal-text` with the question and
+the candidate's current text; Mistral analyzes it and returns a short risk note plus a
+suggested revision that preserves the same facts but phrases them more carefully. Shown in the
+same editable-popup, explicit-Insert pattern as §8.1 — the substance of what the candidate
+wrote is never changed without them reviewing and accepting it.
+
+This is distinct from `LEGAL_CHECKBOX_KEYWORDS` (§6.2), which is about consent checkboxes that
+are never auto-checked at all — this feature is about free-text prose the candidate writes
+themselves, which the two keyword lists (`LEGAL_CHECKBOX_KEYWORDS` vs `LEGAL_TEXT_KEYWORDS`)
+keep separate on purpose.
+
+### 8.3 Matching robustness: short strings after normalization
+`selectMatchingOption()` normalizes punctuation before comparing (so "Bachelor's" and
+"Bachelors" match), but this broke technical terms like "C++", which normalizes down to just
+"c" — a single character that appears as a substring in almost any word, incorrectly winning
+the coverage-bonus match against completely unrelated options (e.g. "TypeScript" matching
+"C++"). The normalized-comparison path now only applies when both sides are at least 3
+characters after normalization; shorter strings fall back to the raw (unnormalized)
+comparison.
 
 ---
 
@@ -289,4 +352,8 @@ python app.py           # http://localhost:5000
 - **CGPA on Workday's Education section** — its `data-automation-id` wasn't confirmed via
   live inspection; the code tries a couple of reasonable guesses, then falls back to a
   text-search within the panel for a "GPA"/"overall result" label.
+- **Pages where the real form is in an iframe on a page whose own domain isn't independently
+  recognized** — the multi-frame detection (§6.6) waits for real fields to appear in whichever
+  frame has them, but this was tuned against one specific Ashby wrapper page; a page with
+  unusually slow third-party scripts could still exceed the poll window in rare cases.
 - **LinkedIn** — deliberately out of scope; see §3.
