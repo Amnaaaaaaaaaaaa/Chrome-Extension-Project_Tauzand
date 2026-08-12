@@ -64,6 +64,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // keep the message channel open for the async response
   }
 
+  if (message.type === "LLM_VALIDATE_LEGAL_TEXT") {
+    fetch(`${BACKEND_URL}/api/llm/validate-legal-text`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: message.question, current_text: message.currentText }),
+    })
+      .then((response) => response.json())
+      .then((data) => sendResponse(data))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true; // keep the message channel open for the async response
+  }
+
   if (message.type === "LLM_SUGGEST") {
     fetch(`${BACKEND_URL}/api/llm/suggest-answer`, {
       method: "POST",

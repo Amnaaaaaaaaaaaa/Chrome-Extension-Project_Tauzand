@@ -259,6 +259,75 @@ def suggest_answer():
         return jsonify({"success": False, "error": str(exc)}), 502
 
 
+@app.post("/api/llm/validate-legal-text")
+def validate_legal_text():
+    """
+    Body: { "question": "...", "current_text": "..." }
+    Powers the extension's "Check for legal risk" button on legal-sensitive
+    free-text questions (e.g. "explain any convictions", "describe the
+    circumstances of the lawsuit"). Analyzes text the candidate has already
+    written and suggests safer phrasing — never rewrites the substance of
+    what they said, only flags risky wording and offers an alternative the
+    candidate must explicitly review and insert themselves.
+    """
+    payload = request.get_json(force=True)
+    question = (payload.get("question") or "").strip()
+    current_text = (payload.get("current_text") or "").strip()
+    if not question or not current_text:
+        return jsonify({"success": False, "error": "question and current_text are required"}), 400
+    if not Config.MISTRAL_API_KEY:
+        return jsonify({"success": False, "error": "Mistral API key not configured on the backend"}), 500
+
+    system_prompt = (
+        "You are helping a job applicant review text they wrote for a legally sensitive "
+        "application question, before they submit it. Do NOT change the facts, admissions, "
+        "or substance of what they wrote — only flag wording that is unnecessarily broad, "
+        "self-incriminating beyond what was asked, or phrased in a way that could create "
+        "legal risk for them, and suggest more precise, factual phrasing that says the same "
+        "true thing more carefully. If the text is already fine, say so plainly and don't "
+        "invent a change for the sake of having one. Respond in exactly this format:\n"
+        "RISK: <one short sentence — either 'No significant concerns found.' or what to watch for>\n"
+        "SUGGESTED: <the revised text, or the original text unchanged if no revision is needed>"
+    )
+    user_prompt = f"Question: {question}\n\nCandidate's current answer:\n{current_text}"
+
+    try:
+        import requests
+        response = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {Config.MISTRAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "mistral-small-latest",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 400,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        result = response.json()
+        raw_reply = result["choices"][0]["message"]["content"].strip()
+
+        risk_note = ""
+        suggested_text = current_text
+        if "SUGGESTED:" in raw_reply:
+            risk_part, suggested_part = raw_reply.split("SUGGESTED:", 1)
+            risk_note = risk_part.replace("RISK:", "").strip()
+            suggested_text = suggested_part.strip()
+        else:
+            risk_note = raw_reply
+
+        return jsonify({"success": True, "risk_note": risk_note, "suggested_text": suggested_text})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
 @app.get("/api/platforms")
 def list_platforms():
     from services.platform_configs import PLATFORM_CONFIGS

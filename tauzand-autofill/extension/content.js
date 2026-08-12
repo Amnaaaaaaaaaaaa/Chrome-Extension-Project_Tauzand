@@ -737,6 +737,158 @@ async function checkForLoginWall() {
 // "Expected CTC"), offer an AI-drafted answer instead of leaving the field
 // blank — but always require the user to review/edit and explicitly click
 // Insert. Nothing from this path is ever auto-filled.
+// ---------- 3c. Legal-risk check for legal-sensitive free-text fields ----------
+// Per instructions: for legal sections, analyze the candidate's own text and
+// suggest optimized phrasing to avoid legal risk. Unlike addAiSuggestButton
+// (which drafts a fresh answer for an EMPTY field), this analyzes whatever
+// the candidate has ALREADY written and never changes the substance of what
+// they said — only flags risky wording. Always shown as an editable
+// suggestion the candidate must explicitly insert, same as AI Suggest.
+function addLegalCheckButton(textareaEl, questionTitle) {
+  if (document.querySelector(`[data-tauzand-legal-button-for="${textareaEl.id}"]`)) return; // avoid duplicate buttons on repeated scans
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "\u2696\uFE0F Check for legal risk";
+  btn.dataset.tauzandLegalButton = "true";
+  if (textareaEl.id) btn.dataset.tauzandLegalButtonFor = textareaEl.id;
+  Object.assign(btn.style, {
+    display: "inline-block",
+    marginTop: "6px",
+    marginLeft: "6px",
+    padding: "5px 12px",
+    fontSize: "12px",
+    fontWeight: "600",
+    fontFamily: "system-ui, sans-serif",
+    background: "#7A1F1F",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+
+  btn.addEventListener("click", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const currentText = textareaEl.value.trim();
+    if (!currentText) {
+      alert("Write something in this field first, then check it for legal risk.");
+      return;
+    }
+    const originalLabel = btn.textContent;
+    btn.textContent = "Checking...";
+    btn.disabled = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "LLM_VALIDATE_LEGAL_TEXT",
+        question: questionTitle,
+        currentText,
+      });
+      if (response && response.success) {
+        showLegalRiskPopup(textareaEl, btn, response.risk_note, response.suggested_text);
+      } else {
+        alert(`Couldn't check this text: ${(response && response.error) || "unknown error"}`);
+      }
+    } catch (err) {
+      console.error("[Tauzand Autofill] legal risk check failed:", err);
+      alert("Couldn't reach the backend for a legal risk check — check it's running.");
+    } finally {
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+    }
+  });
+
+  textareaEl.insertAdjacentElement("afterend", btn);
+}
+
+function showLegalRiskPopup(textareaEl, anchorBtn, riskNote, suggestedText) {
+  const existing = document.getElementById("tauzand-legal-risk-popup");
+  if (existing) existing.remove();
+
+  const popup = document.createElement("div");
+  popup.id = "tauzand-legal-risk-popup";
+  Object.assign(popup.style, {
+    marginTop: "8px",
+    padding: "12px",
+    background: "#FBEEEE",
+    border: "2px solid #7A1F1F",
+    borderRadius: "8px",
+    fontFamily: "system-ui, sans-serif",
+  });
+
+  const riskLabel = document.createElement("div");
+  riskLabel.textContent = riskNote || "No significant concerns found.";
+  Object.assign(riskLabel.style, { fontSize: "12px", fontWeight: "600", marginBottom: "8px", color: "#7A1F1F" });
+  popup.appendChild(riskLabel);
+
+  const editLabel = document.createElement("div");
+  editLabel.textContent = "Suggested revision — edit as needed, then click Insert:";
+  Object.assign(editLabel.style, { fontSize: "11.5px", fontWeight: "400", marginBottom: "6px", color: "#555" });
+  popup.appendChild(editLabel);
+
+  const editArea = document.createElement("textarea");
+  editArea.value = suggestedText;
+  Object.assign(editArea.style, {
+    width: "100%",
+    minHeight: "110px",
+    fontFamily: "inherit",
+    fontSize: "13px",
+    padding: "8px",
+    borderRadius: "6px",
+    border: "1px solid #ccc",
+    boxSizing: "border-box",
+  });
+  popup.appendChild(editArea);
+
+  const btnRow = document.createElement("div");
+  Object.assign(btnRow.style, { marginTop: "8px", display: "flex", gap: "8px" });
+
+  const insertBtn = document.createElement("button");
+  insertBtn.type = "button";
+  insertBtn.textContent = "Insert";
+  Object.assign(insertBtn.style, {
+    padding: "6px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    background: "#7A1F1F",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  insertBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setFieldValue(textareaEl, editArea.value);
+    popup.remove();
+  });
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Keep original";
+  Object.assign(cancelBtn.style, {
+    padding: "6px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    background: "#ffffff",
+    color: "#7A1F1F",
+    border: "1px solid #7A1F1F",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  cancelBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    popup.remove();
+  });
+
+  btnRow.appendChild(insertBtn);
+  btnRow.appendChild(cancelBtn);
+  popup.appendChild(btnRow);
+
+  (anchorBtn || textareaEl).insertAdjacentElement("afterend", popup);
+}
+
 function addAiSuggestButton(textareaEl, questionTitle, profile) {
   const btn = document.createElement("button");
   btn.type = "button";
@@ -903,6 +1055,14 @@ async function fillTextFields(container, config, profile) {
       const fileInput = block.querySelector("input[type='file']");
       if (fileInput) flaggedForReview++;
       continue;
+    }
+
+    // Legal-sensitive free-text question (e.g. "explain any convictions") —
+    // offer the risk-check button regardless of whether this field later
+    // matches a profile key, since the candidate may still type something
+    // here manually that's worth reviewing before submission.
+    if (textInput.tagName === "TEXTAREA" && isLegalSensitiveTextQuestion(questionTitle)) {
+      addLegalCheckButton(textInput, questionTitle);
     }
 
     // "Today's date" signature fields — no static profile value could ever

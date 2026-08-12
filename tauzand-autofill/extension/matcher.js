@@ -169,3 +169,21 @@ function isLegalConsentGroup(questionTitle, optionTexts) {
   const haystack = [questionTitle, ...optionTexts].join(" ").toLowerCase();
   return LEGAL_CHECKBOX_KEYWORDS.some((keyword) => haystack.includes(keyword));
 }
+
+// For open-text (textarea) questions where the candidate explains something
+// with real legal weight — distinct from LEGAL_CHECKBOX_KEYWORDS, which is
+// about consent checkboxes that are never auto-checked. These are prose
+// fields the candidate writes themselves; the AI Suggest button offers a
+// draft, and this separate detector flags when that draft (or anything
+// already typed) is worth an explicit legal-risk check before submitting.
+const LEGAL_TEXT_KEYWORDS = [
+  "conviction", "convicted", "lawsuit", "litigation", "criminal history",
+  "criminal record", "felony", "misdemeanor", "dispute with", "legal action",
+  "legal proceeding", "non-compete", "non compete", "confidentiality obligation",
+  "explain any", "describe any", "describe the circumstances",
+];
+
+function isLegalSensitiveTextQuestion(questionTitle) {
+  const haystack = questionTitle.toLowerCase();
+  return LEGAL_TEXT_KEYWORDS.some((keyword) => haystack.includes(keyword));
+}
