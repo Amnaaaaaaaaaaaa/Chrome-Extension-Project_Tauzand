@@ -229,6 +229,30 @@ function highlightForManualReview(element, label) {
 // Plain `element.value = x` is silently ignored by React-controlled inputs
 // (Ashby, and parts of Workday) because React's internal state never sees
 // the change. This uses the native setter + a real input event instead.
+// Same React-safe value-setting as setFieldValue(), but also dispatches
+// focus + blur — confirmed necessary specifically for Workday's date
+// spinbutton sections (Month/Day/Year), which validate/confirm the typed
+// value on blur. setFieldValue() alone left the value visible in the box
+// but still flagged as invalid until the user manually reselected the same
+// date via the calendar picker.
+async function fillDateSectionInput(element, value) {
+  // Confirmed via testing: setting .value directly (even with the React-safe
+  // native setter plus input/change/blur events) left Workday's date
+  // validation showing "Invalid Date" until the user manually retyped the
+  // same value — the same isTrusted:false problem trustedClick() solves for
+  // clicks, but for keyboard input instead. Real, CDP-dispatched keystrokes
+  // are required for Workday's date-spinbutton validation to accept it.
+  await trustedClick(element); // real, trusted focus click — not element.focus()
+  await sleep(80);
+  // Clear any existing value first (select-all then type over it), in case
+  // this section already has a stale value from a previous fill attempt.
+  const response = await chrome.runtime.sendMessage({ type: "DEBUGGER_TYPE", text: value });
+  if (!response || !response.success) {
+    console.warn(`[Tauzand Autofill] trusted type failed for date section value "${value}":`, response && response.error);
+  }
+  await sleep(80);
+}
+
 function setFieldValue(element, value) {
   const proto = element.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
   const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value").set;
@@ -881,6 +905,51 @@ async function fillTextFields(container, config, profile) {
       continue;
     }
 
+    // "Today's date" signature fields — no static profile value could ever
+    // be correct here since it changes every day, so this is filled
+    // directly with the real current date instead of going through the
+    // normal profile-hint matching at all.
+    const isSignatureDateField = block.querySelector("[id*='dateSigned' i], [id*='signedOn' i], [data-automation-id*='dateSigned' i], [data-automation-id*='signedOn' i]");
+    if (/today'?s date/i.test(questionTitle) || isSignatureDateField) {
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const dd = String(now.getDate()).padStart(2, "0");
+      const yyyy = now.getFullYear();
+
+      // This can be a segmented Month/Day/Year spinbutton date (same
+      // dateInputWrapper pattern as Education/Work Experience's dates,
+      // confirmed via testing) rather than one combined text box — fill
+      // each section separately when that structure is present.
+      const dateWrapper = block.querySelector("[data-automation-id='dateInputWrapper']");
+      if (dateWrapper) {
+        const monthInput = dateWrapper.querySelector("[data-automation-id='dateSectionMonth-input']");
+        const dayInput = dateWrapper.querySelector("[data-automation-id='dateSectionDay-input']");
+        const yearInput = dateWrapper.querySelector("[data-automation-id='dateSectionYear-input']");
+        console.log(`[Tauzand Autofill] "today's date" segmented field — filling Month="${mm}" Day="${dd}" Year="${yyyy}"`);
+        if (monthInput) await fillDateSectionInput(monthInput, mm);
+        if (dayInput) await fillDateSectionInput(dayInput, dd);
+        if (yearInput) await fillDateSectionInput(yearInput, String(yyyy));
+        if (monthInput || dayInput || yearInput) {
+          filledCount++;
+          continue;
+        }
+        // Fall through to the single-box path below if none of the
+        // expected sub-inputs were actually found inside the wrapper.
+      }
+
+      // Year-only spinbutton fields (same pattern as Education/Work
+      // Experience dates) need just the year in their own input, not the
+      // full date typed into one box.
+      const isYearOnlySpinbutton =
+        textInput.getAttribute("role") === "spinbutton" &&
+        (textInput.getAttribute("data-automation-id") === "dateSectionYear-input" || textInput.getAttribute("aria-label") === "Year");
+      const todaysDateValue = isYearOnlySpinbutton ? String(yyyy) : `${mm}/${dd}/${yyyy}`;
+      console.log(`[Tauzand Autofill] "today's date" single-box field — filling with current date: "${todaysDateValue}"`);
+      await typeIntoField(textInput, todaysDateValue);
+      filledCount++;
+      continue;
+    }
+
     const { profileKey, score } = bestProfileMatch(questionTitle);
     console.log(`[Tauzand Autofill] text question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${MIN_TEXT_FIELD_CONFIDENCE})`);
     if (score < MIN_TEXT_FIELD_CONFIDENCE) {
@@ -1016,7 +1085,17 @@ async function fillChoiceFields(container, config, profile) {
       continue;
     }
 
-    const { profileKey, score } = bestProfileMatch(questionTitle);
+    let { profileKey, score } = bestProfileMatch(questionTitle);
+    // Override for disability_status — its title is a generic "Please
+    // check one of the boxes below:" with no mention of "disability" at
+    // all (confirmed via inspection), so the title-text hint system could
+    // never match it confidently no matter how many hints are added. The
+    // block's own automation-id/id is unambiguous, so use that instead when
+    // present.
+    if (block.querySelector("[data-automation-id*='disabilityStatus' i], [id*='disabilityStatus' i]")) {
+      profileKey = "disability_status";
+      score = 1;
+    }
     console.log(`[Tauzand Autofill] choice question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${CHOICE_MATCH_MIN_CONFIDENCE})`);
     if (score < CHOICE_MATCH_MIN_CONFIDENCE) {
       flaggedForReview++;
@@ -1039,7 +1118,18 @@ async function fillChoiceFields(container, config, profile) {
 
     // Checkbox groups: "skills" etc. may be a comma-separated string in the
     // profile, not a real array — same fix as Edge Case 5 on the backend.
-    if (checkboxOptions.length && typeof profileValue === "string" && /[,;]/.test(profileValue)) {
+    // Some fields are always a single answer even though that answer
+    // naturally contains a comma as plain English punctuation (e.g.
+    // disability_status: "No, I do not have a disability and have not had
+    // one in the past") — splitting those on the comma broke the match
+    // entirely, so they're excluded from this heuristic.
+    const SINGLE_VALUE_DESPITE_COMMA_FIELDS = new Set(["disability_status", "veteran_status"]);
+    if (
+      checkboxOptions.length &&
+      typeof profileValue === "string" &&
+      /[,;]/.test(profileValue) &&
+      !SINGLE_VALUE_DESPITE_COMMA_FIELDS.has(profileKey)
+    ) {
       profileValue = profileValue.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
     }
 
@@ -1056,6 +1146,22 @@ async function fillChoiceFields(container, config, profile) {
         filledCount++;
         await sleep(CHOICE_CLICK_DELAY_MS);
         if (PRIORITY_ONLY_FIELDS.has(profileKey)) break; // e.g. referral_source: first match wins, don't try the rest
+      }
+    } else if (checkboxOptions.length && typeof profileValue === "string") {
+      // Single-answer checkbox group (e.g. disability_status, veteran_status)
+      // — rendered as checkboxes but functionally a single Yes/No/decline
+      // choice, so match the whole string against ONE option instead of
+      // iterating it like a multi-value list.
+      const optionPairs = checkboxOptions.map((el) => ({ text: optionTextFor(el), element: el }));
+      const match = selectMatchingOption(optionPairs, profileValue);
+      if (match) {
+        console.log(`[Tauzand Autofill] single-answer checkbox "${questionTitle}" — clicking "${match.text}" for value "${profileValue}"`);
+        clickOption(match.element);
+        filledCount++;
+        await sleep(CHOICE_CLICK_DELAY_MS);
+      } else {
+        flaggedForReview++;
+        highlightForManualReview(checkboxOptions[0], questionTitle);
       }
     } else if (radioOptions.length) {
       const optionPairs = radioOptions.map((el) => ({ text: optionTextFor(el), element: el }));
@@ -1111,13 +1217,19 @@ async function fillChoiceFields(container, config, profile) {
             let elements = [];
             let previousCount = -1;
             const pollStart = Date.now();
-            while (Date.now() - pollStart < 1500) {
+            while (Date.now() - pollStart < 3000) {
               await sleep(120);
               // "[data-automation-id='promptOption']" added alongside
               // role='option' — confirmed via inspection that Workday's open
               // dropdown options use this data attribute instead of an ARIA
-              // role.
-              elements = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']")].filter(isVisible);
+              // role. Also excluding "pill-" ids on THIS clause too — the
+              // pill's own inner label element also carries
+              // data-automation-id="promptOption", so without this it was
+              // still being picked up as a real option even after the
+              // role='option' clause got the same exclusion.
+              elements = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']:not([id^='pill-'])")]
+                .filter(isVisible)
+                .filter((el) => !el.closest("[id^='pill-']"));
               if (elements.length > 0 && elements.length === previousCount) break;
               previousCount = elements.length;
             }
@@ -1187,13 +1299,29 @@ async function fillChoiceFields(container, config, profile) {
               const searchInputForClick = findSearchInput();
               const clickTarget = promptIcon || searchInputForClick || dropdown;
               console.log(`[Tauzand Autofill] clicking for "${val}":`, promptIcon ? "promptIcon" : searchInputForClick ? "search input" : "dropdown wrapper");
-              await trustedClick(clickTarget);
-              await sleep(200);
-              if (searchInputForClick) searchInputForClick.focus();
-              const currentOptions = await searchAndPoll(val);
-              const currentPairs = currentOptions.map((el) => ({ text: optionTextFor(el), element: el }));
-              const currentMatch = selectMatchingOption(currentPairs, val);
-              console.log(`[Tauzand Autofill] multi-value match for "${val}" (${currentOptions.length} option(s): ${currentPairs.map((p) => p.text).join(" | ")}):`, currentMatch ? currentMatch.text : "none found");
+
+              // Retry on zero options — confirmed via testing that this
+              // isn't about poll duration per attempt, but about the page/
+              // widget needing more overall time since load to respond at
+              // all: in a 5-value search, only the LAST value got real
+              // results, purely because more wall-clock time had passed by
+              // then. A short pause + retry lets earlier values in the list
+              // benefit from that same readiness instead of only the one
+              // that happens to be last.
+              let currentOptions = [];
+              let currentPairs = [];
+              let currentMatch = null;
+              for (let attempt = 0; attempt < 3; attempt++) {
+                await trustedClick(clickTarget);
+                await sleep(200);
+                if (searchInputForClick) searchInputForClick.focus();
+                currentOptions = await searchAndPoll(val);
+                currentPairs = currentOptions.map((el) => ({ text: optionTextFor(el), element: el }));
+                currentMatch = selectMatchingOption(currentPairs, val);
+                console.log(`[Tauzand Autofill] multi-value match for "${val}" (attempt ${attempt + 1}, ${currentOptions.length} option(s): ${currentPairs.map((p) => p.text).join(" | ")}):`, currentMatch ? currentMatch.text : "none found");
+                if (currentOptions.length > 0) break; // got real results — no need to retry further, whether or not one of them matched
+                await sleep(800);
+              }
               if (currentMatch) {
                 await trustedClick(currentMatch.element);
                 selectedAny = true;
@@ -1305,9 +1433,11 @@ async function fillEducationSection(profile) {
     let options = [];
     let previousCount = -1;
     const pollStart = Date.now();
-    while (Date.now() - pollStart < 1500) {
+    while (Date.now() - pollStart < 3000) {
       await sleep(150);
-      options = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']")].filter(isVisible);
+      options = [...document.querySelectorAll("[role='option']:not([id^='pill-']), [data-automation-id='promptOption']:not([id^='pill-'])")]
+        .filter(isVisible)
+        .filter((el) => !el.closest("[id^='pill-']"));
       if (options.length > 0 && options.length === previousCount) break;
       previousCount = options.length;
     }
@@ -1364,7 +1494,7 @@ async function fillEducationSection(profile) {
     return true;
   }
 
-  const fillYear = (panel, fieldName, yearStr) => {
+  const fillYear = async (panel, fieldName, yearStr) => {
     if (!yearStr) return false;
     const yearMatch = String(yearStr).match(/\d{4}/);
     if (!yearMatch) return false;
@@ -1372,7 +1502,7 @@ async function fillEducationSection(profile) {
     if (!wrapper) return false;
     const yearInput = wrapper.querySelector('[data-automation-id="dateSectionYear-input"]');
     if (!yearInput) return false;
-    setFieldValue(yearInput, yearMatch[0]);
+    await fillDateSectionInput(yearInput, yearMatch[0]);
     return true;
   };
 
@@ -1396,8 +1526,8 @@ async function fillEducationSection(profile) {
       if (await fillSearchCombobox(newPanel, "fieldOfStudy", entry.field_of_study)) filledCount++;
     }
 
-    if (fillYear(newPanel, "firstYearAttended", entry.start_year)) filledCount++;
-    if (fillYear(newPanel, "lastYearAttended", entry.end_year)) filledCount++;
+    if (await fillYear(newPanel, "firstYearAttended", entry.start_year)) filledCount++;
+    if (await fillYear(newPanel, "lastYearAttended", entry.end_year)) filledCount++;
 
     if (entry.cgpa) {
       // Automation-id for this field wasn't confirmed via inspection —
@@ -1495,7 +1625,7 @@ async function fillWorkExperienceSection(profile) {
 
     // Each date field splits into separate Month/Year spinbutton inputs —
     // "MM/YYYY" in the profile value needs to be split apart to fill both.
-    const fillDate = (fieldName, dateStr) => {
+    const fillDate = async (fieldName, dateStr) => {
       if (!dateStr) return false;
       const parts = String(dateStr).split("/").map((s) => s.trim());
       if (parts.length !== 2) {
@@ -1509,20 +1639,20 @@ async function fillWorkExperienceSection(profile) {
       const yearInput = wrapper.querySelector('[data-automation-id="dateSectionYear-input"]');
       let didFill = false;
       if (monthInput) {
-        setFieldValue(monthInput, month.padStart(2, "0"));
+        await fillDateSectionInput(monthInput, month.padStart(2, "0"));
         didFill = true;
       }
       if (yearInput) {
-        setFieldValue(yearInput, year);
+        await fillDateSectionInput(yearInput, year);
         didFill = true;
       }
       return didFill;
     };
 
-    if (fillDate("startDate", entry.start_date)) filledCount++;
+    if (await fillDate("startDate", entry.start_date)) filledCount++;
     else flaggedForReview++;
     if (!entry.is_current) {
-      if (fillDate("endDate", entry.end_date)) filledCount++;
+      if (await fillDate("endDate", entry.end_date)) filledCount++;
       else flaggedForReview++;
     }
 

@@ -29,6 +29,9 @@ const FIELD_LABEL_HINTS = {
   field_of_study: ["field of study", "major", "area of study"],
   cgpa: ["cgpa", "gpa", "overall result", "grade point average"],
   education_start_year: ["first year attended", "start year", "year started", "from"],
+  non_compete_restrictions: ["non-compete", "non compete", "non-solicitation", "non solicitation"],
+  us_government_employee: ["current or former employee of the united states government", "employee of the united states government", "us government"],
+  export_control_restricted_country: ["export control laws", "iran, cuba, north korea, syria", "citizen, national or resident of any of the following countries"],
   linkedin_url: ["linkedin"],
   portfolio_url: ["portfolio", "website"],
   referral_source: ["how did you hear", "how you heard", "referral source", "how did you find", "how did you learn about"],
@@ -37,7 +40,7 @@ const FIELD_LABEL_HINTS = {
   pronouns: ["pronouns", "preferred pronouns"],
   work_authorized_us: ["authorized to work", "work authorization", "legally authorized"],
   visa_sponsorship_status: ["require sponsorship", "visa sponsorship", "sponsorship for employment"],
-  willing_to_relocate: ["willing to relocate", "able to relocate", "relocate for this role"],
+  willing_to_relocate: ["willing to relocate", "able to relocate", "relocate for this role", "relocating for this role", "consider relocating"],
   github_url: ["github"],
   school: ["school", "university", "college"],
   graduation_date: ["expect to graduate or complete your program", "intended graduation year", "to (actual or expected)", "graduation date", "expected graduation", "when do you expect to graduate"],
@@ -50,7 +53,8 @@ const FIELD_LABEL_HINTS = {
 const LEGAL_CHECKBOX_KEYWORDS = [
   "i agree", "terms and conditions", "terms of service", "privacy policy",
   "consent", "i accept", "i acknowledge", "i certify", "i confirm that",
-  "gdpr", "i authorize",
+  "gdpr", "i authorize", "non-disclosure agreement", "nondisclosure agreement",
+  "arbitration agreement", "read and agree",
 ];
 
 const CHOICE_MATCH_MIN_CONFIDENCE = 0.7;

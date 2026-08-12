@@ -76,6 +76,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // keep the message channel open for the async response
   }
 
+  if (message.type === "DEBUGGER_TYPE") {
+    trustedType(sender.tab.id, message.text)
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true;
+  }
+
   if (message.type === "DEBUGGER_ATTACH") {
     attachDebugger(sender.tab.id)
       .then(() => sendResponse({ success: true }))
@@ -161,6 +168,29 @@ async function trustedClick(tabId, x, y) {
     button: "left",
     clickCount: 1,
   });
+}
+
+async function trustedType(tabId, text) {
+  await attachDebugger(tabId); // defensive — cheap no-op if already attached, self-heals a restarted service worker
+  for (const char of text) {
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+      type: "keyDown",
+      text: char,
+      unmodifiedText: char,
+      key: char,
+    });
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      text: char,
+      unmodifiedText: char,
+      key: char,
+    });
+    // Confirmed via testing that dispatching characters back-to-back with
+    // no gap caused corrupted values (e.g. "06" became "00", "2024" became
+    // "2200") — likely event-queue collisions on Workday's side. A short
+    // pause between characters fixed it.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
 }
 
 // Keep the attachedTabs set clean if the user manually dismisses Chrome's

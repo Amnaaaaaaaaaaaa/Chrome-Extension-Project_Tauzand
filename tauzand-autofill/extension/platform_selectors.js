@@ -72,12 +72,18 @@ const PLATFORM_SELECTORS = {
     // tenant, hence "question blocks found: 0". "^=" (starts-with) fixes
     // this regardless of what follows the "formField-" prefix.
     questionSelector: "[data-automation-id^='formField']",
-    questionTitleSelector: "label, [data-automation-id='label']",
+    // "legend" added — confirmed via inspection that some compliance/
+    // questionnaire-style questions (e.g. "Would you consider relocating")
+    // title themselves via <legend><div data-automation-id="richText">...
+    // instead of a <label>, same pattern as Greenhouse's fieldset-based
+    // questions. Without this, the block's title was empty and the
+    // question was never scanned at all.
+    questionTitleSelector: "label, legend, [data-automation-id='label']",
     // Confirmed via inspection: some fields (e.g. the education "Year"
     // input) have no type attribute at all, so "input[type='text']" alone
     // never matched them — "input:not([type])" catches those too.
     // "input[role='spinbutton']" added specifically for date/year fields.
-    textInputSelector: "input[type='text'], input:not([type]), input[role='spinbutton']",
+    textInputSelector: "input[type='text'], input:not([type]), input[role='spinbutton'], textarea",
     // Not yet confirmed against a live radio/checkbox question on this
     // tenant — reasonable defaults for now, verify and adjust once
     // one is found (same process used for the text field above).
