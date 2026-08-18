@@ -187,3 +187,82 @@ function isLegalSensitiveTextQuestion(questionTitle) {
   const haystack = questionTitle.toLowerCase();
   return LEGAL_TEXT_KEYWORDS.some((keyword) => haystack.includes(keyword));
 }
+
+// ---------- Phase 1: Question Classification (per Chawal's architecture) ----------
+// Groups every field into one of a fixed set of categories, so the next phase
+// (Question Processing Array + a single batched Mistral call per form) knows
+// which fields are simple DB lookups vs. which genuinely need AI. Built on
+// top of the existing legal-detection and profile-matching functions rather
+// than rewriting classification from scratch — this is purely an additional
+// labeling layer for now and does not change any current fill behavior.
+const BEHAVIORAL_KEYWORDS = [
+  "why do you want to join", "why should we hire you", "why are you interested",
+  "what are your strengths", "what are your weaknesses", "where do you see yourself",
+  "why do you want to work", "tell us about yourself", "describe your experience with",
+  "why this role", "why this company", "what makes you", "what interests you",
+];
+
+function isBehavioralQuestion(questionTitle) {
+  const haystack = questionTitle.toLowerCase();
+  return BEHAVIORAL_KEYWORDS.some((keyword) => haystack.includes(keyword));
+}
+
+// Which profile keys belong to which classification bucket — used once a
+// field has already matched a known DB field with high confidence, to sort
+// it into "education" / "experience" / "personal" rather than a flat
+// "known_field" bucket, matching Chawal's example categories.
+const EDUCATION_PROFILE_KEYS = new Set([
+  "school", "degree_type", "field_of_study", "cgpa", "graduation_date",
+  "education_start_year", "education",
+]);
+const EXPERIENCE_PROFILE_KEYS = new Set(["current_company", "work_experience"]);
+const PERSONAL_PROFILE_KEYS = new Set([
+  "full_name", "first_name", "last_name", "email", "phone", "address", "city",
+  "current_location", "postal_code", "date_of_birth", "linkedin_url",
+  "github_url", "portfolio_url",
+]);
+
+const CLASSIFY_MIN_CONFIDENCE = 0.75; // kept in sync with MIN_TEXT_FIELD_CONFIDENCE in content.js
+
+/**
+ * classifyQuestion(questionTitle, fieldKind, optionTexts)
+ * fieldKind: "text" | "textarea" | "radio" | "checkbox" | "dropdown"
+ * Returns one of: "legal" | "behavioral" | "education" | "experience" |
+ * "personal" | "known_field" | "unknown"
+ */
+function classifyQuestion(questionTitle, fieldKind, optionTexts = []) {
+  // Legal takes priority over everything else — a consent question should
+  // never be misclassified as something that might get auto-answered.
+  if ((fieldKind === "checkbox" || fieldKind === "radio" || fieldKind === "dropdown") && isLegalConsentGroup(questionTitle, optionTexts)) {
+    return "legal";
+  }
+  if (fieldKind === "textarea" && isLegalSensitiveTextQuestion(questionTitle)) {
+    return "legal";
+  }
+
+  if (fieldKind === "textarea" && isBehavioralQuestion(questionTitle)) {
+    return "behavioral";
+  }
+
+  const { profileKey, score } = bestProfileMatch(questionTitle);
+  // Match the actual threshold each field type is filled against — text/
+  // textarea fields use MIN_TEXT_FIELD_CONFIDENCE (0.75), but radio/
+  // checkbox/dropdown fields use the lower CHOICE_MATCH_MIN_CONFIDENCE
+  // (0.7) in fillChoiceFields. Using one fixed threshold for classification
+  // regardless of field type caused a field that genuinely does get
+  // auto-filled to be mislabeled "unknown".
+  const effectiveThreshold = fieldKind === "text" || fieldKind === "textarea" ? CLASSIFY_MIN_CONFIDENCE : CHOICE_MATCH_MIN_CONFIDENCE;
+  if (score >= effectiveThreshold) {
+    if (EDUCATION_PROFILE_KEYS.has(profileKey)) return "education";
+    if (EXPERIENCE_PROFILE_KEYS.has(profileKey)) return "experience";
+    if (PERSONAL_PROFILE_KEYS.has(profileKey)) return "personal";
+    return "known_field"; // matched a DB field (e.g. skills, languages) but not one of the buckets above
+  }
+
+  // No confident DB match — an unmatched long-answer field is most likely a
+  // free-answer/behavioral-style question, matching what AI Suggest (§8.1)
+  // already targets.
+  if (fieldKind === "textarea") return "behavioral";
+
+  return "unknown";
+}

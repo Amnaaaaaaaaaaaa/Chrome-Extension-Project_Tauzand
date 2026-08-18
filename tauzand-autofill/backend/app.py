@@ -182,6 +182,110 @@ def close_session(driver_id):
     return jsonify({"success": True})
 
 
+@app.post("/api/llm/batch-generate-behavioral")
+def batch_generate_behavioral():
+    """
+    Body: { "questions": ["...", "..."], "profile": {...} }
+    Phase 2 of the architecture change requested in review: generates answers
+    for ALL behavioral questions on one form in a SINGLE Mistral call, instead
+    of one call per question, to keep API cost/latency down at scale. Strict
+    JSON in and out — no free-form explanation text. PII (phone, email,
+    GitHub, LinkedIn) is never included in what's sent to Mistral, per an
+    explicit instruction in the review.
+    """
+    payload = request.get_json(force=True)
+    questions = payload.get("questions") or []
+    profile = payload.get("profile") or {}
+    job_context = (payload.get("jobContext") or "").strip()
+    if not questions:
+        return jsonify({"success": False, "error": "questions is required and must be non-empty"}), 400
+    if not Config.MISTRAL_API_KEY:
+        return jsonify({"success": False, "error": "Mistral API key not configured on the backend"}), 500
+
+    # PII exclusion, explicit per instruction — only background/skills context
+    # goes in, never contact details or account links.
+    summary_lines = []
+    if profile.get("skills"):
+        summary_lines.append(f"Skills: {profile['skills']}")
+    if profile.get("school") or profile.get("degree_type") or profile.get("field_of_study"):
+        summary_lines.append(
+            f"Education: {profile.get('degree_type', '')} in {profile.get('field_of_study', '')} "
+            f"at {profile.get('school', '')}".strip()
+        )
+    if profile.get("education"):
+        summary_lines.append(f"Education history: {profile['education']}")
+    if profile.get("work_experience"):
+        summary_lines.append(f"Work experience: {profile['work_experience']}")
+    if profile.get("current_company"):
+        summary_lines.append(f"Current company: {profile['current_company']}")
+    profile_summary = "\n".join(summary_lines) or "No additional profile details available."
+
+    system_prompt = (
+        "You are helping a job applicant answer several behavioral job-application questions "
+        "at once (e.g. \"Why do you want to join our company?\", \"What are your strengths?\"). "
+        "For EACH question, write a short, professional, recruiter-friendly answer using the "
+        "candidate's real background where relevant — never invent facts not present in their "
+        "profile. If job/company context is provided, reference it naturally where relevant "
+        "(e.g. mentioning the specific role or company for a \"why do you want to join us\" "
+        "question) instead of writing something fully generic. Keep each answer confident but "
+        "honest, concise (3-5 sentences), and free of generic filler. Respond with ONLY a JSON "
+        "array, one object per question, in the same order as the questions were given, in "
+        "exactly this shape — no other text before or after the array:\n"
+        '[{"question": "<repeat the question>", "answer": "<the answer>", '
+        '"confidence": <0.0-1.0>, "requires_review": <true or false>}]'
+    )
+    user_prompt_parts = [f"Candidate background:\n{profile_summary}"]
+    if job_context:
+        user_prompt_parts.append(f"Job/company context: {job_context}")
+    user_prompt_parts.append(
+        "Questions:\n" + "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+    )
+    user_prompt = "\n\n".join(user_prompt_parts)
+
+    try:
+        import requests
+        response = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {Config.MISTRAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "mistral-small-latest",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.6,
+                "max_tokens": 500 * max(len(questions), 1),
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+        raw_reply = result["choices"][0]["message"]["content"].strip()
+
+        # Mistral occasionally wraps the array in a fenced code block despite
+        # the instruction not to — strip that defensively before parsing.
+        if raw_reply.startswith("```"):
+            raw_reply = raw_reply.strip("`")
+            if raw_reply.lower().startswith("json"):
+                raw_reply = raw_reply[4:].strip()
+
+        import json as json_module
+        parsed = json_module.loads(raw_reply)
+        # Some models wrap a single-object response in {"results": [...]}
+        # rather than a bare array when json_object mode is forced — handle both.
+        if isinstance(parsed, dict) and "results" in parsed:
+            parsed = parsed["results"]
+        if not isinstance(parsed, list):
+            parsed = [parsed]
+
+        return jsonify({"success": True, "results": parsed})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
 @app.post("/api/llm/suggest-answer")
 def suggest_answer():
     """
@@ -227,13 +331,18 @@ def suggest_answer():
         "relevant — never invent facts not present in their profile. Keep it confident but "
         "honest, concise (3-5 sentences unless the question clearly calls for more, e.g. a "
         "single number for something like expected salary), and free of generic filler "
-        "phrases. Output ONLY the answer text — no greeting, no sign-off, no explanation of "
-        "what you did."
+        "phrases. Respond with ONLY a JSON object, no other text before or after it, in "
+        "exactly this shape:\n"
+        '{"answer": "<the answer, no greeting, no sign-off>", "confidence": <0.0-1.0, how '
+        "well the candidate's profile supports this answer>, "
+        '"requires_review": <true if the profile had little to go on and the answer leans '
+        "generic, false if it's well-grounded in their actual background>}"
     )
     user_prompt = f"Question: {question}\n\nCandidate background:\n{profile_summary}\n\nWrite the answer."
 
     try:
         import requests
+        import json as json_module
         response = requests.post(
             "https://api.mistral.ai/v1/chat/completions",
             headers={
@@ -253,8 +362,18 @@ def suggest_answer():
         )
         response.raise_for_status()
         result = response.json()
-        suggestion = result["choices"][0]["message"]["content"].strip()
-        return jsonify({"success": True, "suggestion": suggestion})
+        raw_reply = result["choices"][0]["message"]["content"].strip()
+        if raw_reply.startswith("```"):
+            raw_reply = raw_reply.strip("`")
+            if raw_reply.lower().startswith("json"):
+                raw_reply = raw_reply[4:].strip()
+        parsed = json_module.loads(raw_reply)
+        return jsonify({
+            "success": True,
+            "answer": parsed.get("answer", ""),
+            "confidence": parsed.get("confidence"),
+            "requires_review": parsed.get("requires_review", True),
+        })
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 502
 
@@ -285,14 +404,19 @@ def validate_legal_text():
         "self-incriminating beyond what was asked, or phrased in a way that could create "
         "legal risk for them, and suggest more precise, factual phrasing that says the same "
         "true thing more carefully. If the text is already fine, say so plainly and don't "
-        "invent a change for the sake of having one. Respond in exactly this format:\n"
-        "RISK: <one short sentence — either 'No significant concerns found.' or what to watch for>\n"
-        "SUGGESTED: <the revised text, or the original text unchanged if no revision is needed>"
+        "invent a change for the sake of having one. Respond with ONLY a JSON object, no "
+        "other text before or after it, in exactly this shape:\n"
+        '{"risk_note": "<one short sentence — either \'No significant concerns found.\' or '
+        'what to watch for>", "suggested_text": "<the revised text, or the original text '
+        'unchanged if no revision is needed>", "confidence": <0.0-1.0, how confident you are '
+        'in this risk assessment>, "requires_review": <true if there is any real concern '
+        "worth the candidate's attention, false only if the text is clearly fine>}"
     )
     user_prompt = f"Question: {question}\n\nCandidate's current answer:\n{current_text}"
 
     try:
         import requests
+        import json as json_module
         response = requests.post(
             "https://api.mistral.ai/v1/chat/completions",
             headers={
@@ -313,17 +437,19 @@ def validate_legal_text():
         response.raise_for_status()
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"].strip()
+        if raw_reply.startswith("```"):
+            raw_reply = raw_reply.strip("`")
+            if raw_reply.lower().startswith("json"):
+                raw_reply = raw_reply[4:].strip()
+        parsed = json_module.loads(raw_reply)
 
-        risk_note = ""
-        suggested_text = current_text
-        if "SUGGESTED:" in raw_reply:
-            risk_part, suggested_part = raw_reply.split("SUGGESTED:", 1)
-            risk_note = risk_part.replace("RISK:", "").strip()
-            suggested_text = suggested_part.strip()
-        else:
-            risk_note = raw_reply
-
-        return jsonify({"success": True, "risk_note": risk_note, "suggested_text": suggested_text})
+        return jsonify({
+            "success": True,
+            "risk_note": parsed.get("risk_note", ""),
+            "suggested_text": parsed.get("suggested_text", current_text),
+            "confidence": parsed.get("confidence"),
+            "requires_review": parsed.get("requires_review", True),
+        })
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 502
 

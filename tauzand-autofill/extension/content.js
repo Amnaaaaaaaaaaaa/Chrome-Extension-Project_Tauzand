@@ -188,7 +188,7 @@ function createBanner(onClick) {
     whiteSpace: "normal",
   });
   disclaimer.innerHTML =
-    'Always verify the content before final submitting. ' +
+    'AI can make mistakes. Always review every response before submitting your application. ' +
     '<a href="https://www.tauzand.in/terms-and-conditions" target="_blank" rel="noopener noreferrer" style="color:#ffffff;text-decoration:underline;">Terms &amp; Conditions</a>';
   // Stop the click from bubbling up to the banner's own click handler —
   // otherwise clicking the T&C link would also trigger autofill.
@@ -538,21 +538,50 @@ async function fillComboboxField(input, value) {
       return elements;
     }
 
-    await typeIntoField(input, value);
-    await sleep(300);
-    let optionElements = await pollForOptions();
+    // If the value contains characters unlikely to match any real option
+    // cleanly (e.g. "/" from "Undergraduate/Bachelor's"), try a cleaned,
+    // shorter version FIRST instead of always trying the full "dirty" value
+    // first and only falling back after it predictably finds nothing —
+    // confirmed via testing this was wasted effort every time such a value
+    // occurred, and avoids typing the special character into the search box
+    // at all when a clean version is available upfront.
+    const hasSpecialChars = /[/\\()]/.test(String(value));
+    const valueParts = String(value).trim().split(/[\s/]+/).filter(Boolean);
+    const cleanedShorterQuery = valueParts.length > 1 ? valueParts[valueParts.length - 1] : null;
 
-    if (optionElements.length === 0) {
-      const parts = String(value).trim().split(/[\s/]+/).filter(Boolean);
-      const shorterQuery = parts.length > 1 ? parts[parts.length - 1] : null; // e.g. "Bachelors" from "Undergraduate/Bachelors", or "2027" from "June 2027"
-      if (shorterQuery) {
-        console.log(`[Tauzand Autofill] combobox: full value "${value}" showed no options, retrying with "${shorterQuery}"`);
-        setFieldValue(input, "");
-        await sleep(100);
-        await typeIntoField(input, shorterQuery);
-        await sleep(300);
-        optionElements = await pollForOptions();
-      }
+    let firstAttemptValue = value;
+    let optionElements;
+    if (hasSpecialChars && cleanedShorterQuery) {
+      console.log(`[Tauzand Autofill] combobox: value "${value}" has special characters — trying cleaned "${cleanedShorterQuery}" first instead`);
+      await typeIntoField(input, cleanedShorterQuery);
+      await sleep(300);
+      optionElements = await pollForOptions();
+      firstAttemptValue = cleanedShorterQuery;
+    } else {
+      await typeIntoField(input, value);
+      await sleep(300);
+      optionElements = await pollForOptions();
+    }
+
+    if (optionElements.length === 0 && firstAttemptValue !== value) {
+      // The cleaned version found nothing either — fall back to trying the
+      // original full value, in case it genuinely was needed.
+      console.log(`[Tauzand Autofill] combobox: cleaned value "${firstAttemptValue}" showed no options, falling back to full value "${value}"`);
+      setFieldValue(input, "");
+      await sleep(100);
+      await typeIntoField(input, value);
+      await sleep(300);
+      optionElements = await pollForOptions();
+    } else if (optionElements.length === 0 && cleanedShorterQuery && firstAttemptValue === value) {
+      // Plain multi-word value with no special characters (e.g. "June
+      // 2027") — the full value was tried first and found nothing, so fall
+      // back to just the last word (e.g. "2027").
+      console.log(`[Tauzand Autofill] combobox: full value "${value}" showed no options, retrying with "${cleanedShorterQuery}"`);
+      setFieldValue(input, "");
+      await sleep(100);
+      await typeIntoField(input, cleanedShorterQuery);
+      await sleep(300);
+      optionElements = await pollForOptions();
     }
 
     console.log(`[Tauzand Autofill] combobox suggestions found for "${value}":`, optionElements.map(optionTextFor));
@@ -911,6 +940,20 @@ function addAiSuggestButton(textareaEl, questionTitle, profile) {
   btn.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // Phase 2: check the pre-fetched batch cache first — populated by ONE
+    // Mistral call covering every behavioral question on this form, right
+    // after the scan finished. If it's there, show it instantly with no
+    // extra API call. Falling back to a live per-field call only covers
+    // cases the batch didn't (e.g. the batch call itself failed).
+    const cached = window.__tauzandBehavioralAnswerCache && window.__tauzandBehavioralAnswerCache.get(questionTitle);
+    console.log(`[Tauzand Autofill] AI Suggest clicked for "${questionTitle}" — cache lookup:`, cached);
+    if (cached) {
+      console.log(`[Tauzand Autofill] using CACHED answer:`, cached.answer);
+      showSuggestionPopup(textareaEl, btn, cached.answer);
+      return;
+    }
+
     const originalLabel = btn.textContent;
     btn.textContent = "Thinking...";
     btn.disabled = true;
@@ -920,8 +963,9 @@ function addAiSuggestButton(textareaEl, questionTitle, profile) {
         question: questionTitle,
         profile,
       });
+      console.log(`[Tauzand Autofill] LIVE call response:`, response);
       if (response && response.success) {
-        showSuggestionPopup(textareaEl, btn, response.suggestion);
+        showSuggestionPopup(textareaEl, btn, response.answer);
       } else {
         alert(`Couldn't get an AI suggestion: ${(response && response.error) || "unknown error"}`);
       }
@@ -1313,7 +1357,12 @@ async function fillChoiceFields(container, config, profile) {
       // choice, so match the whole string against ONE option instead of
       // iterating it like a multi-value list.
       const optionPairs = checkboxOptions.map((el) => ({ text: optionTextFor(el), element: el }));
-      const match = selectMatchingOption(optionPairs, profileValue);
+      // minRatio raised from the 0.55 default to 0.65 — confirmed via
+      // testing that 0.55 let a weak, coincidental letter-overlap match
+      // ("None" matching "London" purely on generic character similarity,
+      // no real semantic relation) get force-selected instead of correctly
+      // falling back to manual review when no option genuinely fits.
+      const match = selectMatchingOption(optionPairs, profileValue, 0.65);
       if (match) {
         console.log(`[Tauzand Autofill] single-answer checkbox "${questionTitle}" — clicking "${match.text}" for value "${profileValue}"`);
         clickOption(match.element);
@@ -1822,6 +1871,80 @@ async function fillWorkExperienceSection(profile) {
   return { filledCount, flaggedForReview };
 }
 
+// ---------- Phase 1: Question Processing Array (diagnostic pass) ----------
+// Builds the array Chawal's architecture is centered on — one entry per
+// field, each classified by classifyQuestion() (matcher.js). This does NOT
+// change any fill behavior yet; it's logged so the classification can be
+// checked against real forms before the next phase (a single batched
+// Mistral call per form, built on top of this array) is wired in.
+function buildQuestionProcessingArray(container, config) {
+  const blocks = [...container.querySelectorAll(config.questionSelector)].filter(isVisible);
+  const array = [];
+
+  for (const block of blocks) {
+    const titleEl = block.querySelector(config.questionTitleSelector);
+    if (!titleEl) continue;
+    const questionTitle = titleEl.textContent.trim();
+    if (!questionTitle) continue;
+
+    const textInput = block.querySelector(config.textInputSelector);
+    const radioOptions = [...block.querySelectorAll(config.radioSelector)].filter(isVisible);
+    const checkboxOptions = [...block.querySelectorAll(config.checkboxSelector)].filter(isVisible);
+    const dropdownTriggers = config.selectSelector ? [...block.querySelectorAll(config.selectSelector)].filter(isVisible) : [];
+
+    let fieldKind = null;
+    if (textInput) fieldKind = textInput.tagName === "TEXTAREA" ? "textarea" : "text";
+    else if (radioOptions.length) fieldKind = "radio";
+    else if (checkboxOptions.length) fieldKind = "checkbox";
+    else if (dropdownTriggers.length) fieldKind = "dropdown";
+    if (!fieldKind) continue; // not a field type we know how to fill at all
+
+    const optionTexts = [...radioOptions, ...checkboxOptions].map((el) => optionTextFor(el));
+    const type = classifyQuestion(questionTitle, fieldKind, optionTexts);
+
+    array.push({ question: questionTitle, fieldKind, type, element: textInput || null });
+  }
+
+  return array;
+}
+
+// Generic, platform-independent extraction of job title/company context —
+// tries the most reliable common signals in order, since every ATS marks
+// this up differently and there's no single selector that works everywhere.
+// Used to give Mistral job/company context for behavioral answers (e.g.
+// "Why do you want to join our company?"), per explicit instruction that
+// this be included alongside resume/profile, not just the candidate's own
+// background in isolation.
+// Fallback for company name when og:site_name isn't on the page (confirmed
+// via testing this happens on some Ashby postings) — Greenhouse, Lever, and
+// Ashby all put the company slug as the first URL path segment (e.g.
+// greenhouse.io/cloudflare/..., lever.co/quantco-/..., ashbyhq.com/Ashby/...).
+function extractCompanyNameFromUrl() {
+  const host = window.location.hostname;
+  const firstPathSegment = window.location.pathname.split("/").filter(Boolean)[0];
+  if (!firstPathSegment) return null;
+  if (host.includes("greenhouse.io") || host.includes("lever.co") || host.includes("ashbyhq.com")) {
+    return firstPathSegment.replace(/-+$/, "").replace(/-/g, " ").trim(); // "quantco-" -> "quantco", "some-company" -> "some company"
+  }
+  return null;
+}
+
+function extractJobContext() {
+  const ogTitle = document.querySelector('meta[property="og:title"]');
+  const ogSiteName = document.querySelector('meta[property="og:site_name"]');
+  const firstHeading = document.querySelector("h1");
+
+  const parts = [];
+  if (ogTitle && ogTitle.content) parts.push(ogTitle.content.trim());
+  else if (firstHeading && firstHeading.textContent.trim()) parts.push(firstHeading.textContent.trim());
+  else if (document.title) parts.push(document.title.trim());
+
+  const companyName = (ogSiteName && ogSiteName.content && ogSiteName.content.trim()) || extractCompanyNameFromUrl();
+  if (companyName) parts.push(`at ${companyName}`);
+
+  return parts.join(" ").slice(0, 200); // keep this short — it's just context, not a full job description
+}
+
 async function runAutofill(profileId) {
   showToast("Fetching your profile...");
   let profile;
@@ -1859,7 +1982,52 @@ async function runAutofill(profileId) {
     await chrome.runtime.sendMessage({ type: "DEBUGGER_ATTACH" });
 
     showToast("Filling form...");
+    const questionProcessingArray = buildQuestionProcessingArray(document, config);
+    console.log("[Tauzand Autofill] Question Processing Array:", questionProcessingArray);
+    console.table(questionProcessingArray);
     console.log("[Tauzand Autofill] question blocks found:", document.querySelectorAll(config.questionSelector).length);
+
+    // Phase 2: one batched Mistral call for every behavioral question on
+    // this form, instead of a separate call each time someone clicks
+    // "AI Suggest" on a given field — per the review's cost/latency
+    // requirement. Populates a cache the buttons check first; a failure
+    // here just means those buttons fall back to their original per-field
+    // behavior, so this can never make things worse than before Phase 2.
+    window.__tauzandBehavioralAnswerCache = new Map();
+    const behavioralEntries = questionProcessingArray.filter((entry) => entry.type === "behavioral");
+    if (behavioralEntries.length > 0) {
+      showToast(`Drafting ${behavioralEntries.length} behavioral answer(s)...`);
+      const jobContext = extractJobContext();
+      console.log("[Tauzand Autofill] job context extracted for behavioral answers:", jobContext);
+      try {
+        const batchResponse = await chrome.runtime.sendMessage({
+          type: "BATCH_GENERATE_BEHAVIORAL",
+          questions: behavioralEntries.map((entry) => entry.question),
+          profile,
+          jobContext,
+        });
+        if (batchResponse && batchResponse.success && Array.isArray(batchResponse.results)) {
+          // Cache keyed by the ORIGINAL question text (matched by array
+          // position), not the "question" text Mistral echoes back —
+          // confirmed via testing that Mistral doesn't always repeat the
+          // question with byte-for-byte exact text (dropped trailing "*",
+          // minor rewording), which broke the cache lookup even when the
+          // batch call itself succeeded and returned a valid answer.
+          batchResponse.results.forEach((result, index) => {
+            const originalQuestion = behavioralEntries[index] && behavioralEntries[index].question;
+            if (originalQuestion && result && result.answer) {
+              window.__tauzandBehavioralAnswerCache.set(originalQuestion, result);
+            }
+          });
+          console.log(`[Tauzand Autofill] batched behavioral answers ready: ${window.__tauzandBehavioralAnswerCache.size}/${behavioralEntries.length}`);
+        } else {
+          console.warn("[Tauzand Autofill] batch behavioral generation failed — AI Suggest buttons will fall back to per-field calls:", batchResponse && batchResponse.error);
+        }
+      } catch (err) {
+        console.warn("[Tauzand Autofill] batch behavioral generation errored — AI Suggest buttons will fall back to per-field calls:", err);
+      }
+      showToast("Filling form...");
+    }
 
     const { filledCount: textFilledCount, flaggedForReview: textFlaggedForReview } = await fillTextFields(document, config, profile);
     console.log("[Tauzand Autofill] text fields filled:", textFilledCount, "| flagged for review:", textFlaggedForReview);
