@@ -234,14 +234,14 @@ function classifyQuestion(questionTitle, fieldKind, optionTexts = []) {
   // Legal takes priority over everything else — a consent question should
   // never be misclassified as something that might get auto-answered.
   if ((fieldKind === "checkbox" || fieldKind === "radio" || fieldKind === "dropdown") && isLegalConsentGroup(questionTitle, optionTexts)) {
-    return "legal";
+    return { type: "legal", matchedProfileKey: null };
   }
   if (fieldKind === "textarea" && isLegalSensitiveTextQuestion(questionTitle)) {
-    return "legal";
+    return { type: "legal", matchedProfileKey: null };
   }
 
   if (fieldKind === "textarea" && isBehavioralQuestion(questionTitle)) {
-    return "behavioral";
+    return { type: "behavioral", matchedProfileKey: null };
   }
 
   const { profileKey, score } = bestProfileMatch(questionTitle);
@@ -253,16 +253,16 @@ function classifyQuestion(questionTitle, fieldKind, optionTexts = []) {
   // auto-filled to be mislabeled "unknown".
   const effectiveThreshold = fieldKind === "text" || fieldKind === "textarea" ? CLASSIFY_MIN_CONFIDENCE : CHOICE_MATCH_MIN_CONFIDENCE;
   if (score >= effectiveThreshold) {
-    if (EDUCATION_PROFILE_KEYS.has(profileKey)) return "education";
-    if (EXPERIENCE_PROFILE_KEYS.has(profileKey)) return "experience";
-    if (PERSONAL_PROFILE_KEYS.has(profileKey)) return "personal";
-    return "known_field"; // matched a DB field (e.g. skills, languages) but not one of the buckets above
+    if (EDUCATION_PROFILE_KEYS.has(profileKey)) return { type: "education", matchedProfileKey: profileKey };
+    if (EXPERIENCE_PROFILE_KEYS.has(profileKey)) return { type: "experience", matchedProfileKey: profileKey };
+    if (PERSONAL_PROFILE_KEYS.has(profileKey)) return { type: "personal", matchedProfileKey: profileKey };
+    return { type: "known_field", matchedProfileKey: profileKey }; // matched a DB field (e.g. skills, languages) but not one of the buckets above
   }
 
   // No confident DB match — an unmatched long-answer field is most likely a
   // free-answer/behavioral-style question, matching what AI Suggest (§8.1)
   // already targets.
-  if (fieldKind === "textarea") return "behavioral";
+  if (fieldKind === "textarea") return { type: "behavioral", matchedProfileKey: null };
 
-  return "unknown";
+  return { type: "unknown", matchedProfileKey: null };
 }

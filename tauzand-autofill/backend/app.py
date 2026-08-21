@@ -185,20 +185,27 @@ def close_session(driver_id):
 @app.post("/api/llm/batch-generate-behavioral")
 def batch_generate_behavioral():
     """
-    Body: { "questions": ["...", "..."], "profile": {...} }
+    Body: { "questions": [...], "choiceQuestions": [{...}], "legalItems": ["...", "..."], "profile": {...} }
     Phase 2 of the architecture change requested in review: generates answers
-    for ALL behavioral questions on one form in a SINGLE Mistral call, instead
-    of one call per question, to keep API cost/latency down at scale. Strict
-    JSON in and out — no free-form explanation text. PII (phone, email,
-    GitHub, LinkedIn) is never included in what's sent to Mistral, per an
-    explicit instruction in the review.
+    for ALL behavioral questions, "unknown" choice-type (radio/checkbox)
+    fields, AND legal-consent section analyses on one form in a SINGLE
+    Mistral call, instead of one call per question, to keep API cost/
+    latency down at scale. For choiceQuestions, Mistral picks one option
+    verbatim from the given list rather than writing free text. For
+    legalItems, Mistral analyzes the consent text into structured checkpoints
+    and risk flags — purely informational, never an agreement on the
+    candidate's behalf. Strict JSON in and out — no free-form explanation
+    text. PII (phone, email, GitHub, LinkedIn) is never included in what's
+    sent to Mistral, per an explicit instruction in the review.
     """
     payload = request.get_json(force=True)
     questions = payload.get("questions") or []
+    choice_questions = payload.get("choiceQuestions") or []
+    legal_items = payload.get("legalItems") or []
     profile = payload.get("profile") or {}
     job_context = (payload.get("jobContext") or "").strip()
-    if not questions:
-        return jsonify({"success": False, "error": "questions is required and must be non-empty"}), 400
+    if not questions and not choice_questions and not legal_items:
+        return jsonify({"success": False, "error": "questions, choiceQuestions, or legalItems is required and must be non-empty"}), 400
     if not Config.MISTRAL_API_KEY:
         return jsonify({"success": False, "error": "Mistral API key not configured on the backend"}), 500
 
@@ -221,25 +228,70 @@ def batch_generate_behavioral():
     profile_summary = "\n".join(summary_lines) or "No additional profile details available."
 
     system_prompt = (
-        "You are helping a job applicant answer several behavioral job-application questions "
-        "at once (e.g. \"Why do you want to join our company?\", \"What are your strengths?\"). "
-        "For EACH question, write a short, professional, recruiter-friendly answer using the "
-        "candidate's real background where relevant — never invent facts not present in their "
-        "profile. If job/company context is provided, reference it naturally where relevant "
-        "(e.g. mentioning the specific role or company for a \"why do you want to join us\" "
-        "question) instead of writing something fully generic. Keep each answer confident but "
-        "honest, concise (3-5 sentences), and free of generic filler. Respond with ONLY a JSON "
-        "array, one object per question, in the same order as the questions were given, in "
-        "exactly this shape — no other text before or after the array:\n"
-        '[{"question": "<repeat the question>", "answer": "<the answer>", '
-        '"confidence": <0.0-1.0>, "requires_review": <true or false>}]'
+        "You are helping a job applicant with a batch of job-application questions from one "
+        "form, in a single pass. There are up to three kinds of items:\n\n"
+        "1. OPEN questions (behavioral, e.g. \"Why do you want to join our company?\") — write a "
+        "short, professional, recruiter-friendly answer using the candidate's real background "
+        "where relevant. Never invent facts not present in their profile. If job/company "
+        "context is provided, reference it naturally where relevant instead of writing "
+        "something fully generic. Keep each answer confident but honest, concise (3-5 "
+        "sentences), and free of generic filler.\n\n"
+        "2. CHOICE questions — each comes with a list of the ONLY valid options. Pick the "
+        "single option that best fits the candidate's background, and return its text EXACTLY "
+        "as given — do not paraphrase or invent a new option. Some CHOICE questions include a "
+        "\"Note\" giving the candidate's actual stored answer, which just doesn't textually "
+        "match any option (e.g. stored \"Female\", options are \"Man\"/\"Woman\"). Treat that as "
+        "a high-confidence translation, not a guess — pick the equivalent option confidently. "
+        "For everything else, do NOT guess at sensitive personal characteristics (age, "
+        "ethnicity, disability, veteran status, or similar) the candidate's profile has no "
+        "actual information about — if you cannot confidently determine the answer from their "
+        "real background, return an empty string for \"answer\" and set requires_review to "
+        "true.\n\n"
+        "3. LEGAL items — each is the full text of a legal/consent section from the form (e.g. "
+        "a privacy-policy acknowledgment, an arbitration agreement, a data-processing consent). "
+        "You are NOT deciding whether the candidate agrees — just explain what the section is "
+        "actually asking for, in plain English, so the candidate can make an informed decision "
+        "themselves. For each: list 2-4 short \"checkpoints\" (what it actually says/asks — "
+        "e.g. \"Consents to background check\", \"Agrees to binding arbitration instead of a "
+        "lawsuit\"), a short list of \"risk_flags\" (anything unusual, broad, or worth extra "
+        "attention — empty list if nothing stands out), and \"recommended_action\" as either "
+        "\"review\" (always safe default) or \"straightforward\" (only for genuinely standard, "
+        "low-stakes consent language, e.g. a plain privacy-notice acknowledgment).\n\n"
+        "Respond with ONLY a JSON object, no other text before or after it, in exactly this "
+        "shape — arrays in the same order the items were given, and any array can be empty if "
+        "there were no items of that kind:\n"
+        '{"open_answers": [{"question": "<repeat the question>", "answer": "<the answer>", '
+        '"confidence": <0.0-1.0>, "requires_review": <true/false>}], '
+        '"choice_answers": [{"question": "<repeat the question>", "answer": "<exact option text, '
+        'or empty string if unsure>", "confidence": <0.0-1.0>, "requires_review": <true/false>}], '
+        '"legal_analyses": [{"type": "legal_consent", "checkpoints": ["...", "..."], '
+        '"risk_flags": ["..."], "recommended_action": "review" or "straightforward", '
+        '"requires_review": true}]}'
     )
     user_prompt_parts = [f"Candidate background:\n{profile_summary}"]
     if job_context:
         user_prompt_parts.append(f"Job/company context: {job_context}")
-    user_prompt_parts.append(
-        "Questions:\n" + "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-    )
+    if questions:
+        user_prompt_parts.append(
+            "OPEN questions:\n" + "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        )
+    if choice_questions:
+        choice_lines = []
+        for i, cq in enumerate(choice_questions):
+            options_str = " | ".join(cq.get("options") or [])
+            line = f"{i + 1}. {cq.get('question', '')}\n   Options: {options_str}"
+            profile_value_hint = cq.get("profileValueHint")
+            if profile_value_hint:
+                line += (
+                    f"\n   Note: the candidate's stored answer for this is \"{profile_value_hint}\" — "
+                    "it didn't textually match any option above, but pick whichever option means the "
+                    "same thing (e.g. a stored value of \"Female\" should pick an option like \"Woman\")."
+                )
+            choice_lines.append(line)
+        user_prompt_parts.append("CHOICE questions:\n" + "\n".join(choice_lines))
+    if legal_items:
+        legal_lines = [f"{i + 1}. {text}" for i, text in enumerate(legal_items)]
+        user_prompt_parts.append("LEGAL items:\n" + "\n".join(legal_lines))
     user_prompt = "\n\n".join(user_prompt_parts)
 
     try:
@@ -256,8 +308,8 @@ def batch_generate_behavioral():
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.6,
-                "max_tokens": 500 * max(len(questions), 1),
+                "temperature": 0.4,
+                "max_tokens": 500 * max(len(questions), 1) + 150 * len(choice_questions) + 250 * len(legal_items),
             },
             timeout=30,
         )
@@ -265,7 +317,7 @@ def batch_generate_behavioral():
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"].strip()
 
-        # Mistral occasionally wraps the array in a fenced code block despite
+        # Mistral occasionally wraps the object in a fenced code block despite
         # the instruction not to — strip that defensively before parsing.
         if raw_reply.startswith("```"):
             raw_reply = raw_reply.strip("`")
@@ -274,14 +326,19 @@ def batch_generate_behavioral():
 
         import json as json_module
         parsed = json_module.loads(raw_reply)
-        # Some models wrap a single-object response in {"results": [...]}
-        # rather than a bare array when json_object mode is forced — handle both.
-        if isinstance(parsed, dict) and "results" in parsed:
-            parsed = parsed["results"]
-        if not isinstance(parsed, list):
-            parsed = [parsed]
 
-        return jsonify({"success": True, "results": parsed})
+        # Backward-compatible: if the model (or an older client) returns a
+        # bare array instead of {"open_answers": [...]}, treat it as the
+        # open-answers list, matching the previous response shape.
+        if isinstance(parsed, list):
+            return jsonify({"success": True, "results": parsed, "choiceResults": [], "legalResults": []})
+
+        return jsonify({
+            "success": True,
+            "results": parsed.get("open_answers", []),
+            "choiceResults": parsed.get("choice_answers", []),
+            "legalResults": parsed.get("legal_analyses", []),
+        })
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 502
 

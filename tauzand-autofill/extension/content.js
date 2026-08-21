@@ -918,6 +918,104 @@ function showLegalRiskPopup(textareaEl, anchorBtn, riskNote, suggestedText) {
   (anchorBtn || textareaEl).insertAdjacentElement("afterend", popup);
 }
 
+// ---------- Choice-field AI suggestion (Point 5/9: unknown fields too) ----------
+// For "unknown" radio/checkbox fields the confidence-matcher couldn't
+// handle, but that DO have real options — shows what Mistral picked (from
+// the SAME batch call as behavioral questions, so this adds no extra API
+// calls) as a suggestion the user must explicitly accept. Never auto-
+// selects the option itself.
+// ---------- Legal-consent breakdown (Point 2) ----------
+// For legal-consent sections (never auto-checked — see isLegalConsentGroup),
+// shows Mistral's structured analysis of what the section is actually
+// asking for, from the SAME batch call as behavioral/choice questions.
+// Purely informational: this never checks the box, never agrees to
+// anything, and is explicitly labeled as AI-generated so the user knows to
+// still read the actual consent text themselves before deciding.
+function addLegalConsentInfoBox(block, questionTitle) {
+  const cached = window.__tauzandLegalAnswerCache && window.__tauzandLegalAnswerCache.get(questionTitle);
+  if (!cached) return;
+  if (document.querySelector(`[data-tauzand-legal-info-for="${block.id || questionTitle}"]`)) return; // avoid duplicates on repeated scans
+
+  const box = document.createElement("div");
+  box.dataset.tauzandLegalInfoFor = block.id || questionTitle;
+  Object.assign(box.style, {
+    marginTop: "8px",
+    padding: "10px 12px",
+    background: "#FBEEEE",
+    border: "1px solid #7A1F1F",
+    borderRadius: "8px",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "12.5px",
+    color: "#333",
+    maxWidth: "500px",
+  });
+
+  const label = document.createElement("div");
+  label.textContent = "\u2696\uFE0F AI summary of this section \u2014 you still need to read and decide yourself:";
+  Object.assign(label.style, { fontWeight: "600", marginBottom: "6px", color: "#7A1F1F" });
+  box.appendChild(label);
+
+  if (Array.isArray(cached.checkpoints) && cached.checkpoints.length > 0) {
+    const list = document.createElement("ul");
+    Object.assign(list.style, { margin: "0 0 6px 0", paddingLeft: "18px" });
+    for (const point of cached.checkpoints) {
+      const li = document.createElement("li");
+      li.textContent = point;
+      list.appendChild(li);
+    }
+    box.appendChild(list);
+  }
+
+  if (Array.isArray(cached.risk_flags) && cached.risk_flags.length > 0) {
+    const riskLine = document.createElement("div");
+    riskLine.textContent = "\u26A0\uFE0F " + cached.risk_flags.join("; ");
+    Object.assign(riskLine.style, { color: "#7A1F1F", fontWeight: "600", marginTop: "4px" });
+    box.appendChild(riskLine);
+  }
+
+  block.appendChild(box);
+}
+
+function addChoiceSuggestionButton(block, questionTitle) {
+  const cached = window.__tauzandChoiceAnswerCache && window.__tauzandChoiceAnswerCache.get(questionTitle);
+  if (!cached || !cached.answer) return; // nothing to suggest — leave the existing manual-review highlight as-is
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = `\u2728 AI suggests: "${cached.answer}" — click to accept`;
+  Object.assign(btn.style, {
+    display: "block",
+    marginTop: "6px",
+    padding: "5px 12px",
+    fontSize: "12px",
+    fontWeight: "600",
+    fontFamily: "system-ui, sans-serif",
+    background: "#1F4E79",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: "pointer",
+    textAlign: "left",
+    maxWidth: "100%",
+  });
+
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const optionPairs = (cached.optionElements || []).map((el) => ({ text: optionTextFor(el), element: el }));
+    const match = selectMatchingOption(optionPairs, cached.answer, 0.7);
+    if (match) {
+      clickOption(match.element);
+      btn.textContent = "\u2705 Applied";
+      btn.disabled = true;
+    } else {
+      alert("Couldn't find that exact option on the page — please select manually.");
+    }
+  });
+
+  block.appendChild(btn);
+}
+
 function addAiSuggestButton(textareaEl, questionTitle, profile) {
   const btn = document.createElement("button");
   btn.type = "button";
@@ -1877,7 +1975,7 @@ async function fillWorkExperienceSection(profile) {
 // change any fill behavior yet; it's logged so the classification can be
 // checked against real forms before the next phase (a single batched
 // Mistral call per form, built on top of this array) is wired in.
-function buildQuestionProcessingArray(container, config) {
+function buildQuestionProcessingArray(container, config, profile) {
   const blocks = [...container.querySelectorAll(config.questionSelector)].filter(isVisible);
   const array = [];
 
@@ -1900,9 +1998,39 @@ function buildQuestionProcessingArray(container, config) {
     if (!fieldKind) continue; // not a field type we know how to fill at all
 
     const optionTexts = [...radioOptions, ...checkboxOptions].map((el) => optionTextFor(el));
-    const type = classifyQuestion(questionTitle, fieldKind, optionTexts);
+    const { type, matchedProfileKey } = classifyQuestion(questionTitle, fieldKind, optionTexts);
 
-    array.push({ question: questionTitle, fieldKind, type, element: textInput || null });
+    // For choice-fields that matched a real profile key but whose value
+    // doesn't textually match any available option (e.g. profile has
+    // "Female" but this form's options are "Man"/"Woman"/... — a synonym
+    // problem plain text-similarity can't bridge), flag this with the
+    // actual profile value so it can be sent to Mistral alongside genuinely
+    // "unknown" fields, instead of just silently failing to manual review.
+    let profileValueHint = null;
+    if (matchedProfileKey && (fieldKind === "radio" || fieldKind === "checkbox") && optionTexts.length > 0) {
+      const profileValue = resolveProfileValue(profile, matchedProfileKey);
+      if (profileValue && typeof profileValue === "string" && !/[,;]/.test(profileValue)) {
+        const optionPairs = optionTexts.map((text) => ({ text }));
+        const existingMatch = selectMatchingOption(optionPairs, profileValue);
+        if (!existingMatch) profileValueHint = profileValue; // plain text-matching found nothing — AI may still be able to
+      }
+    }
+
+    array.push({
+      question: questionTitle,
+      fieldKind,
+      type,
+      element: textInput || null,
+      block,
+      // Options + their clickable elements — only meaningful for radio/
+      // checkbox fields, used to let Mistral pick from the REAL available
+      // options for "unknown" choice-type questions, and to click the
+      // matching one afterward (never auto-selected — see the review-
+      // required suggestion UI this feeds into).
+      options: fieldKind === "radio" || fieldKind === "checkbox" ? optionTexts : null,
+      optionElements: fieldKind === "radio" || fieldKind === "checkbox" ? [...radioOptions, ...checkboxOptions] : null,
+      profileValueHint,
+    });
   }
 
   return array;
@@ -1982,7 +2110,7 @@ async function runAutofill(profileId) {
     await chrome.runtime.sendMessage({ type: "DEBUGGER_ATTACH" });
 
     showToast("Filling form...");
-    const questionProcessingArray = buildQuestionProcessingArray(document, config);
+    const questionProcessingArray = buildQuestionProcessingArray(document, config, profile);
     console.log("[Tauzand Autofill] Question Processing Array:", questionProcessingArray);
     console.table(questionProcessingArray);
     console.log("[Tauzand Autofill] question blocks found:", document.querySelectorAll(config.questionSelector).length);
@@ -1994,37 +2122,91 @@ async function runAutofill(profileId) {
     // here just means those buttons fall back to their original per-field
     // behavior, so this can never make things worse than before Phase 2.
     window.__tauzandBehavioralAnswerCache = new Map();
+    window.__tauzandChoiceAnswerCache = new Map();
+    window.__tauzandLegalAnswerCache = new Map();
     const behavioralEntries = questionProcessingArray.filter((entry) => entry.type === "behavioral");
-    if (behavioralEntries.length > 0) {
-      showToast(`Drafting ${behavioralEntries.length} behavioral answer(s)...`);
+    // Two kinds of fields get AI help here, per instruction to try Mistral
+    // for review-flagged fields too instead of leaving them silently for
+    // manual review with no assistance:
+    // 1. "unknown" fields the confidence-matcher couldn't handle at all.
+    // 2. Fields that DID match a profile key, but whose stored value has no
+    //    textually-similar option on this form (e.g. profile has "Female"
+    //    but the form's options are "Man"/"Woman"/... — a synonym problem
+    //    plain text-similarity can't bridge, which AI can).
+    // Scoped to radio/checkbox only for now (dropdown options aren't
+    // collected until the dropdown is opened, which buildQuestionProcessingArray
+    // doesn't do).
+    const unknownChoiceEntries = questionProcessingArray.filter(
+      (entry) =>
+        (entry.type === "unknown" || entry.profileValueHint) &&
+        (entry.fieldKind === "radio" || entry.fieldKind === "checkbox") &&
+        entry.options &&
+        entry.options.length > 0
+    );
+    // Legal-consent sections (Point 2) — never auto-checked, but Mistral
+    // analyzes the actual consent text into a plain-English breakdown
+    // (checkpoints, risk flags, whether it's required) shown next to the
+    // field, purely informational. Scoped to checkbox/radio/dropdown
+    // consent groups only — textarea-type "legal" entries already have
+    // their own dedicated "Check for legal risk" feature (analyzing the
+    // candidate's own written text, not the consent language itself).
+    const legalEntries = questionProcessingArray.filter(
+      (entry) => entry.type === "legal" && (entry.fieldKind === "checkbox" || entry.fieldKind === "radio" || entry.fieldKind === "dropdown")
+    );
+    if (behavioralEntries.length > 0 || unknownChoiceEntries.length > 0 || legalEntries.length > 0) {
+      const totalCount = behavioralEntries.length + unknownChoiceEntries.length + legalEntries.length;
+      showToast(`Drafting ${totalCount} AI-assisted answer(s)...`);
       const jobContext = extractJobContext();
-      console.log("[Tauzand Autofill] job context extracted for behavioral answers:", jobContext);
+      console.log("[Tauzand Autofill] job context extracted for AI-assisted answers:", jobContext);
       try {
         const batchResponse = await chrome.runtime.sendMessage({
           type: "BATCH_GENERATE_BEHAVIORAL",
           questions: behavioralEntries.map((entry) => entry.question),
+          choiceQuestions: unknownChoiceEntries.map((entry) => ({
+            question: entry.question,
+            options: entry.options,
+            profileValueHint: entry.profileValueHint || null,
+          })),
+          legalItems: legalEntries.map((entry) => entry.question),
           profile,
           jobContext,
         });
-        if (batchResponse && batchResponse.success && Array.isArray(batchResponse.results)) {
+        if (batchResponse && batchResponse.success) {
           // Cache keyed by the ORIGINAL question text (matched by array
           // position), not the "question" text Mistral echoes back —
           // confirmed via testing that Mistral doesn't always repeat the
           // question with byte-for-byte exact text (dropped trailing "*",
           // minor rewording), which broke the cache lookup even when the
           // batch call itself succeeded and returned a valid answer.
-          batchResponse.results.forEach((result, index) => {
+          const openResults = Array.isArray(batchResponse.results) ? batchResponse.results : [];
+          openResults.forEach((result, index) => {
             const originalQuestion = behavioralEntries[index] && behavioralEntries[index].question;
             if (originalQuestion && result && result.answer) {
               window.__tauzandBehavioralAnswerCache.set(originalQuestion, result);
             }
           });
-          console.log(`[Tauzand Autofill] batched behavioral answers ready: ${window.__tauzandBehavioralAnswerCache.size}/${behavioralEntries.length}`);
+          const choiceResults = Array.isArray(batchResponse.choiceResults) ? batchResponse.choiceResults : [];
+          choiceResults.forEach((result, index) => {
+            const entry = unknownChoiceEntries[index];
+            if (entry && result && result.answer) {
+              window.__tauzandChoiceAnswerCache.set(entry.question, { ...result, optionElements: entry.optionElements, options: entry.options });
+            }
+          });
+          const legalResults = Array.isArray(batchResponse.legalResults) ? batchResponse.legalResults : [];
+          legalResults.forEach((result, index) => {
+            const originalQuestion = legalEntries[index] && legalEntries[index].question;
+            if (originalQuestion && result) {
+              window.__tauzandLegalAnswerCache.set(originalQuestion, result);
+            }
+          });
+          console.log(
+            `[Tauzand Autofill] batched answers ready: ${window.__tauzandBehavioralAnswerCache.size}/${behavioralEntries.length} behavioral, ${window.__tauzandChoiceAnswerCache.size}/${unknownChoiceEntries.length} choice, ${window.__tauzandLegalAnswerCache.size}/${legalEntries.length} legal`
+          );
         } else {
-          console.warn("[Tauzand Autofill] batch behavioral generation failed — AI Suggest buttons will fall back to per-field calls:", batchResponse && batchResponse.error);
+          console.warn("[Tauzand Autofill] batch generation failed — AI Suggest buttons will fall back to per-field calls:", batchResponse && batchResponse.error);
         }
       } catch (err) {
-        console.warn("[Tauzand Autofill] batch behavioral generation errored — AI Suggest buttons will fall back to per-field calls:", err);
+        console.warn("[Tauzand Autofill] batch generation errored — AI Suggest buttons will fall back to per-field calls:", err);
       }
       showToast("Filling form...");
     }
@@ -2041,6 +2223,29 @@ async function runAutofill(profileId) {
     }
 
     const { filledCount: choiceFilledCount, flaggedForReview: choiceFlaggedForReview } = await fillChoiceFields(document, config, profile);
+
+    // Point 5/9: for "unknown" radio/checkbox fields that got a suggestion
+    // from the same batch Mistral call as behavioral questions, add a
+    // suggestion button next to them — never auto-selected.
+    if (window.__tauzandChoiceAnswerCache && window.__tauzandChoiceAnswerCache.size > 0) {
+      for (const entry of questionProcessingArray) {
+        if ((entry.type === "unknown" || entry.profileValueHint) && (entry.fieldKind === "radio" || entry.fieldKind === "checkbox") && entry.block) {
+          addChoiceSuggestionButton(entry.block, entry.question);
+        }
+      }
+    }
+
+    // Point 2: for legal-consent sections that got a structured breakdown
+    // from the same batch call, show it — purely informational, the
+    // checkbox itself is still never auto-checked (see fillChoiceFields'
+    // isLegalConsentGroup handling, unchanged).
+    if (window.__tauzandLegalAnswerCache && window.__tauzandLegalAnswerCache.size > 0) {
+      for (const entry of questionProcessingArray) {
+        if (entry.type === "legal" && (entry.fieldKind === "checkbox" || entry.fieldKind === "radio" || entry.fieldKind === "dropdown") && entry.block) {
+          addLegalConsentInfoBox(entry.block, entry.question);
+        }
+      }
+    }
 
     showToast("Filling education...");
     const { filledCount: eduFilledCount, flaggedForReview: eduFlaggedForReview } = await fillEducationSection(profile);

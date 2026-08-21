@@ -68,7 +68,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     fetch(`${BACKEND_URL}/api/llm/batch-generate-behavioral`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ questions: message.questions, profile: message.profile, jobContext: message.jobContext }),
+      body: JSON.stringify({ questions: message.questions, choiceQuestions: message.choiceQuestions, legalItems: message.legalItems, profile: message.profile, jobContext: message.jobContext }),
     })
       .then((response) => response.json())
       .then((data) => sendResponse(data))
