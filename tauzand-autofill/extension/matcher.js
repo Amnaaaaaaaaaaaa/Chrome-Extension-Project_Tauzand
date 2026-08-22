@@ -221,9 +221,28 @@ function isLegalSensitiveTextQuestion(questionTitle) {
 const BEHAVIORAL_KEYWORDS = [
   "why do you want to join", "why should we hire you", "why are you interested",
   "what are your strengths", "what are your weaknesses", "where do you see yourself",
-  "why do you want to work", "tell us about yourself", "describe your experience with",
+  "why do you want to work", "tell us about yourself",
   "why this role", "why this company", "what makes you", "what interests you",
 ];
+
+// "Technical" classification (Step 2 of the requested pipeline) — questions
+// asking about specific technical experience, skills, or challenges, as
+// distinct from general motivation/fit questions (BEHAVIORAL_KEYWORDS
+// above). Processed through the identical resume/profile-grounded
+// generation pipeline as behavioral questions (same Mistral call, same
+// "never invent facts" rule) — this only affects classification labeling,
+// not how the answer gets generated.
+const TECHNICAL_KEYWORDS = [
+  "describe your experience with", "technical challenge", "hardest technical",
+  "describe a project", "walk us through a project", "your approach to",
+  "technical skills", "programming languages", "describe how you would",
+  "explain how you would", "debugging", "architecture decision",
+];
+
+function isTechnicalQuestion(questionTitle) {
+  const haystack = questionTitle.toLowerCase();
+  return TECHNICAL_KEYWORDS.some((keyword) => haystack.includes(keyword));
+}
 
 function isBehavioralQuestion(questionTitle) {
   const haystack = questionTitle.toLowerCase();
@@ -250,8 +269,8 @@ const CLASSIFY_MIN_CONFIDENCE = 0.75; // kept in sync with MIN_TEXT_FIELD_CONFID
 /**
  * classifyQuestion(questionTitle, fieldKind, optionTexts)
  * fieldKind: "text" | "textarea" | "radio" | "checkbox" | "dropdown"
- * Returns one of: "legal" | "behavioral" | "education" | "experience" |
- * "personal" | "known_field" | "unknown"
+ * Returns one of: "legal" | "behavioral" | "technical" | "education" |
+ * "experience" | "personal" | "known_field" | "unknown"
  */
 function classifyQuestion(questionTitle, fieldKind, optionTexts = []) {
   // Legal takes priority over everything else — a consent question should
@@ -261,6 +280,10 @@ function classifyQuestion(questionTitle, fieldKind, optionTexts = []) {
   }
   if (fieldKind === "textarea" && isLegalSensitiveTextQuestion(questionTitle)) {
     return { type: "legal", matchedProfileKey: null };
+  }
+
+  if (fieldKind === "textarea" && isTechnicalQuestion(questionTitle)) {
+    return { type: "technical", matchedProfileKey: null };
   }
 
   if (fieldKind === "textarea" && isBehavioralQuestion(questionTitle)) {

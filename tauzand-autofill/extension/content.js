@@ -11,6 +11,17 @@
 
 const MIN_TEXT_FIELD_CONFIDENCE = 0.75; // mirrors fill_fields()'s default in form_filler.py
 
+// Step 7 of the requested pipeline: "Fill the field automatically when
+// confidence is sufficiently high." Deliberately conservative (0.85, not
+// just above MIN_TEXT_FIELD_CONFIDENCE) — this only applies to AI-
+// GENERATED content (behavioral answers, choice-field suggestions), which
+// carries more risk of being subtly wrong than a straight DB lookup, so it
+// warrants a higher bar before skipping the explicit click. Legal-consent
+// sections are excluded from this entirely, regardless of confidence — see
+// addLegalConsentInfoBox, which never auto-checks a consent box under any
+// circumstance.
+const AI_AUTOFILL_CONFIDENCE_THRESHOLD = 0.85;
+
 // ---------- 1. Platform detection ----------
 const platformKey = detectPlatform(window.location.hostname);
 console.log("[Tauzand Autofill] content script loaded on:", window.location.href, "| detected platform:", platformKey, "| top frame:", window.self === window.top);
@@ -976,6 +987,26 @@ function addLegalConsentInfoBox(block, questionTitle) {
   block.appendChild(box);
 }
 
+// Step 7: shown next to a field that was auto-filled by AI (high
+// confidence, per AI_AUTOFILL_CONFIDENCE_THRESHOLD) instead of requiring an
+// explicit Insert/Accept click — still visibly marks it as AI-touched, so
+// the person doesn't mistake it for a plain DB-matched field and skip
+// reviewing it before submitting, consistent with the banner's disclaimer.
+function addAiFilledIndicator(anchorElement, insertAfter = true) {
+  const badge = document.createElement("div");
+  badge.textContent = "\u{1F916} AI-filled — please review before submitting";
+  Object.assign(badge.style, {
+    display: "block",
+    marginTop: "4px",
+    fontSize: "11.5px",
+    fontWeight: "600",
+    fontFamily: "system-ui, sans-serif",
+    color: "#1F4E79",
+  });
+  if (insertAfter) anchorElement.insertAdjacentElement("afterend", badge);
+  else anchorElement.appendChild(badge);
+}
+
 function addChoiceSuggestionButton(block, questionTitle) {
   const cached = window.__tauzandChoiceAnswerCache && window.__tauzandChoiceAnswerCache.get(questionTitle);
   if (!cached || !cached.answer) return; // nothing to suggest — leave the existing manual-review highlight as-is
@@ -1266,13 +1297,24 @@ async function fillTextFields(container, config, profile) {
     const { profileKey, score } = bestProfileMatch(questionTitle);
     console.log(`[Tauzand Autofill] text question "${questionTitle}" -> matched key "${profileKey}" (score: ${score.toFixed(2)}, need >= ${MIN_TEXT_FIELD_CONFIDENCE})`);
     if (score < MIN_TEXT_FIELD_CONFIDENCE) {
-      flaggedForReview++; // real text field, but couldn't confidently match it to a profile key
       // Long-answer questions (e.g. "Best project you worked on",
-      // "Expected CTC") never match our fixed profile-field hints — offer
-      // an AI-drafted answer instead of just leaving it blank. Scoped to
-      // <textarea> only, per instructions.
+      // "Expected CTC") never match our fixed profile-field hints. Step 7:
+      // if the batch call already produced a high-confidence answer for
+      // this exact question, fill it directly instead of just offering a
+      // button — still marked with a visible AI-filled indicator so it's
+      // not mistaken for a plain DB match.
       if (textInput.tagName === "TEXTAREA") {
+        const cachedBehavioral = window.__tauzandBehavioralAnswerCache && window.__tauzandBehavioralAnswerCache.get(questionTitle);
+        if (cachedBehavioral && !cachedBehavioral.requires_review && (cachedBehavioral.confidence || 0) >= AI_AUTOFILL_CONFIDENCE_THRESHOLD) {
+          setFieldValue(textInput, cachedBehavioral.answer);
+          addAiFilledIndicator(textInput);
+          filledCount++;
+          continue;
+        }
+        flaggedForReview++; // real text field, but couldn't confidently match it to a profile key, and no high-confidence AI answer either
         addAiSuggestButton(textInput, questionTitle, profile);
+      } else {
+        flaggedForReview++;
       }
       continue;
     }
@@ -2135,7 +2177,7 @@ async function runAutofill(profileId) {
     window.__tauzandBehavioralAnswerCache = new Map();
     window.__tauzandChoiceAnswerCache = new Map();
     window.__tauzandLegalAnswerCache = new Map();
-    const behavioralEntries = questionProcessingArray.filter((entry) => entry.type === "behavioral");
+    const behavioralEntries = questionProcessingArray.filter((entry) => entry.type === "behavioral" || entry.type === "technical");
     // Two kinds of fields get AI help here, per instruction to try Mistral
     // for review-flagged fields too instead of leaving them silently for
     // manual review with no assistance:
@@ -2238,10 +2280,33 @@ async function runAutofill(profileId) {
 
     // Point 5/9: for "unknown" radio/checkbox fields that got a suggestion
     // from the same batch Mistral call as behavioral questions, add a
-    // suggestion button next to them — never auto-selected.
+    // suggestion button next to them — or, per Step 7, auto-select
+    // directly when the answer is high-confidence.
     if (window.__tauzandChoiceAnswerCache && window.__tauzandChoiceAnswerCache.size > 0) {
       for (const entry of questionProcessingArray) {
         if ((entry.type === "unknown" || entry.profileValueHint) && (entry.fieldKind === "radio" || entry.fieldKind === "checkbox") && entry.block) {
+          const cachedChoice = window.__tauzandChoiceAnswerCache.get(entry.question);
+          const isHighConfidence =
+            cachedChoice && cachedChoice.answer && !cachedChoice.requires_review && (cachedChoice.confidence || 0) >= AI_AUTOFILL_CONFIDENCE_THRESHOLD;
+          if (isHighConfidence) {
+            const optionPairs = (cachedChoice.optionElements || []).map((el) => ({ text: optionTextFor(el), element: el }));
+            const answerParts = cachedChoice.answer.split("|").map((part) => part.trim()).filter(Boolean);
+            let appliedCount = 0;
+            for (const part of answerParts) {
+              const match = selectMatchingOptionWithOthersFallback(optionPairs, part, 0.7);
+              if (match) {
+                clickOption(match.element);
+                appliedCount++;
+              }
+            }
+            if (appliedCount > 0) {
+              addAiFilledIndicator(entry.block, false);
+              continue; // successfully auto-filled — skip the suggestion button entirely
+            }
+            // Matching failed despite high confidence (e.g. option text
+            // changed) — fall through to the normal suggestion button below
+            // so the person can still act on it manually.
+          }
           addChoiceSuggestionButton(entry.block, entry.question);
         }
       }
