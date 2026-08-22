@@ -283,33 +283,169 @@ The most complex platform, for several reasons:
 
 ---
 
-## 8. AI features
+## 8. AI architecture
 
-### 8.1 AI Suggest (long-answer questions)
-For `<textarea>` fields the confidence-matcher can't handle (e.g. "Best project you worked
-on", "Expected CTC") — these will never match a fixed profile-field hint — a small
-"✨ AI Suggest" button appears next to the field. Clicking it calls
-`POST /api/llm/suggest-answer` (Flask) with the question text and a compact, relevant-only
-profile summary (skills, education, work experience). Mistral generates a draft; the user
-sees it in an editable popup and must explicitly click **Insert** — nothing is ever
-auto-filled from this path.
+Built around a **Question Processing Array**: every field on the page is scanned once and
+classified into a category (`personal`, `education`, `experience`, `known_field`, `behavioral`,
+`technical`, `legal`, or `unknown`) *before* any decision is made about how to fill it. This
+happens in `classifyQuestion()` (`matcher.js`) + `buildQuestionProcessingArray()` (`content.js`),
+and is the foundation everything else in this section is built on top of.
 
-### 8.2 Legal-risk check (legal-sensitive free-text questions)
+The core cost principle: **one Mistral call per form**, regardless of how many AI-assisted
+fields that form has. Every category below that needs AI is collected into arrays first, then
+sent together in a single `POST /api/llm/batch-generate-behavioral` request — never one call
+per question. Confirmed via testing on a 6-behavioral-question form: `batched behavioral
+answers ready: 6/6` from exactly one network request.
+
+### 8.1 What gets classified where, and what happens to it
+
+| Classification | Where it comes from | What happens |
+|---|---|---|
+| `personal` / `education` / `experience` / `known_field` | Matched a profile key above the fill threshold | Filled straight from Supabase — no AI involved (Step 3 of the pipeline: DB first) |
+| `behavioral` | Textarea matching `BEHAVIORAL_KEYWORDS`, or any unmatched textarea as a catch-all | Sent to Mistral as an OPEN question (free-text answer) |
+| `technical` | Textarea matching `TECHNICAL_KEYWORDS` (e.g. "describe your experience with", "technical challenge") | Sent to Mistral in the *same* batch as `behavioral` — identical generation treatment, kept as a distinct classification label per the requested category list |
+| `legal` | Checkbox/radio/dropdown matching `LEGAL_CHECKBOX_KEYWORDS`, or textarea matching `LEGAL_TEXT_KEYWORDS` | Consent groups: **never auto-checked**, but analyzed for a plain-English breakdown (§8.4). Free-text legal questions: separate "Check for legal risk" feature (§8.6), unrelated to the batch call |
+| `unknown` (radio/checkbox with real options) | No confident DB match, but the field has selectable options | Sent to Mistral as a CHOICE question — pick from the given options (§8.3) |
+| `unknown` with a `profileValueHint` | Matched a DB key, but the stored value doesn't textually match any option (e.g. `gender: "Female"` vs. a form's "Man"/"Woman") | Also sent as a CHOICE question, with the stored value given as a translation hint — this is a synonym problem, not a missing-value problem |
+| `unknown` (everything else — comboboxes, non-checkbox/radio fields) | No confident match, no usable option list | Left for manual review, same as before this AI work — see §10 for why this specific case (text-input-backed comboboxes) isn't covered yet |
+
+### 8.2 The batched call (`POST /api/llm/batch-generate-behavioral`)
+
+Despite the name (kept for backward compatibility), this single endpoint now handles three
+independent kinds of work in one request:
+
+```json
+// Request
+{
+  "questions": ["Why do you want to join our company?", "..."],      // behavioral + technical
+  "choiceQuestions": [
+    {"question": "...", "options": ["Man", "Woman", "..."], "fieldKind": "radio",
+     "profileValueHint": "Female"}
+  ],
+  "legalItems": ["I acknowledge that I have read and agree to the Privacy Policy..."],
+  "profile": {...},     // PII-stripped — see below
+  "jobContext": "Software Engineer Intern (Fall 2026) at cloudflare"
+}
+```
+
+```json
+// Response
+{
+  "success": true,
+  "results": [{"question": "...", "answer": "...", "confidence": 0.9, "requires_review": false}],
+  "choiceResults": [{"question": "...", "answer": "Woman", "confidence": 0.95, "requires_review": false}],
+  "legalResults": [{"type": "legal_consent", "checkpoints": [...], "risk_flags": [...],
+                     "recommended_action": "review", "requires_review": true}]
+}
+```
+
+**PII exclusion** (explicit requirement): the profile summary built for the prompt only ever
+includes skills, education, work experience, and current company — phone, email, GitHub, and
+LinkedIn are never included in what's sent to Mistral, enforced in `app.py`'s
+`profile_summary` construction, not left to the model to decide.
+
+**Cache-key matching is by array position, not by text-matching Mistral's echoed question.**
+Confirmed via testing: Mistral doesn't always repeat a question byte-for-byte (dropped a
+trailing `*`, minor rewording), which broke a naive `cache.set(result.question, ...)` even
+when the batch call itself succeeded. The cache is populated by matching `results[i]` to the
+original `behavioralEntries[i]` by index instead.
+
+**Token budget scales with content, not just count.** The batch endpoint's `max_tokens` is
+computed as `500 * len(questions) + 150 * len(choiceQuestions) + 250 * len(legalItems)`.
+Confirmed via testing that an earlier flat `200 * len(questions)` budget was too tight —
+Mistral's response (which has to repeat each question plus write a 3-5 sentence answer) got
+cut off mid-JSON, causing a parse failure (`Unterminated string...`) that silently fell back to
+per-field calls instead of using the batch. The fix wasn't a smarter parser — it was giving the
+model enough room to actually finish.
+
+### 8.3 Choice-field AI assist ("unknown" and value-mismatch fields)
+
+For radio/checkbox fields Mistral is asked to pick from a fixed option list — **never write
+free text and never invent an option that isn't in the list** (e.g. answering "No preference"
+or "N/A" when neither is a real option, confirmed as a failure mode during testing before this
+constraint was added explicitly). Multi-select questions (marked `"fieldKind": "checkbox"` in
+the request) may return more than one option separated by `" | "`; the accept-handler splits on
+that separator and clicks each matched option in turn, rather than treating the whole combined
+string as one option to search for (which would never match, since no real option literally
+contains a pipe character).
+
+Shown as a "✨ AI suggests: '...' — click to accept" button next to the field — clicking it
+calls `selectMatchingOptionWithOthersFallback()` (§8.5) against the field's real options and
+clicks the match. Below the confidence threshold in §8.7, this button is the only way the
+suggestion gets applied; above it, it's applied automatically (§8.7).
+
+### 8.4 Legal-consent structured breakdown
+
+For legal-consent checkbox/radio/dropdown groups (never for free-text legal questions — those
+have a separate feature, §8.6), Mistral analyzes the *actual consent text on the page* into:
+`checkpoints` (2-4 short bullets on what it's actually asking for), `risk_flags` (anything
+unusual or worth extra attention), and `recommended_action` (`"review"` or `"straightforward"`).
+Displayed as an info box directly under the checkbox, explicitly labeled "AI summary of this
+section — you still need to read and decide yourself." **The checkbox itself is never touched**
+— this is purely informational, layered on top of the existing "always leave consent to the
+user" rule (§6.2), not a replacement for it.
+
+### 8.5 "Always check Others"
+
+`selectMatchingOptionWithOthersFallback()` wraps the core `selectMatchingOption()` matcher: if
+no exact or equivalent option is found, it looks for a standalone "Other"/"Others" option
+(`/^others?\b/i` — matches "Other (please specify)", doesn't match "Another" or "otherwise")
+and selects that instead of leaving an answerable question unfilled. Applied to every
+**single-value, fixed-option-list** match site (native `<select>`, single-answer checkboxes,
+radio groups, Workday's Degree button, the AI-suggestion accept flow) — deliberately **not**
+applied to multi-value loops (Skills, Languages, comma-separated referral sources), where
+falling back to "Others" for every individual unmatched item in a multi-select list would be
+wrong, and not applied to typed-search comboboxes (School, Field of Study), where "Others"
+wouldn't reliably appear among live search results for an unrelated query anyway.
+
+### 8.6 Job/company context
+
+`extractJobContext()` pulls the job title and company name into the prompt for behavioral/
+technical answers, so "why do you want to join us" references the actual role instead of being
+fully generic. Tries `og:title` → first `<h1>` → `document.title` for the job title, and
+`og:site_name` → the URL's first path segment for the company name (Greenhouse, Lever, and
+Ashby all put the company slug there — `greenhouse.io/cloudflare/...`,
+`lever.co/quantco-/...`, `ashbyhq.com/Ashby/...`) as a fallback when the meta tag isn't present,
+which is common on some postings.
+
+### 8.7 Step 7 — auto-fill on high confidence
+
+Deliberately conservative: `AI_AUTOFILL_CONFIDENCE_THRESHOLD = 0.85`, higher than
+`MIN_TEXT_FIELD_CONFIDENCE` (0.75) used for plain DB matches, because AI-*generated* content
+(vs. a straight profile lookup) carries more risk of being subtly wrong. When a behavioral/
+technical/choice answer clears this bar **and** `requires_review` is `false`, the field is
+filled or the option is clicked directly — no button click required — but always with a visible
+"🤖 AI-filled — please review before submitting" marker next to it, so it's never mistaken for
+a plain, unremarkable DB match and skipped over at review time. Below the threshold, the
+original manual accept-button behavior is unchanged. **Legal-consent sections are excluded from
+this entirely, at any confidence level** — see §8.4; a consent checkbox is never auto-checked
+under any circumstance.
+
+### 8.8 AI Suggest (long-answer questions, single-field fallback)
+
+The original, still-live fallback path: if the batch call fails entirely (network error, parse
+failure) or a field wasn't part of it for some reason, clicking "✨ AI Suggest" makes a live
+`POST /api/llm/suggest-answer` call for just that one field instead. Same strict-JSON shape
+(`answer`/`confidence`/`requires_review`) as the batch endpoint, same PII exclusion, shown in
+the same editable-popup pattern requiring an explicit Insert click.
+
+### 8.9 Legal-risk check (legal-sensitive free-text questions)
+
 For `<textarea>` fields whose title matches a legal-sensitive keyword (`LEGAL_TEXT_KEYWORDS`
 in `matcher.js` — "conviction", "lawsuit", "explain any", "non-compete", etc.), a
 "⚖️ Check for legal risk" button appears whenever the candidate has already typed something
 into the field. Clicking it calls `POST /api/llm/validate-legal-text` with the question and
 the candidate's current text; Mistral analyzes it and returns a short risk note plus a
 suggested revision that preserves the same facts but phrases them more carefully. Shown in the
-same editable-popup, explicit-Insert pattern as §8.1 — the substance of what the candidate
+same editable-popup, explicit-Insert pattern as §8.8 — the substance of what the candidate
 wrote is never changed without them reviewing and accepting it.
 
-This is distinct from `LEGAL_CHECKBOX_KEYWORDS` (§6.2), which is about consent checkboxes that
-are never auto-checked at all — this feature is about free-text prose the candidate writes
-themselves, which the two keyword lists (`LEGAL_CHECKBOX_KEYWORDS` vs `LEGAL_TEXT_KEYWORDS`)
-keep separate on purpose.
+This is distinct from `LEGAL_CHECKBOX_KEYWORDS` (§6.2) and the consent breakdown (§8.4), which
+are about checkboxes that are never auto-checked at all — this feature is about free-text prose
+the candidate writes themselves, which the two keyword lists (`LEGAL_CHECKBOX_KEYWORDS` vs
+`LEGAL_TEXT_KEYWORDS`) keep separate on purpose.
 
-### 8.3 Matching robustness: short strings after normalization
+### 8.10 Matching robustness: short strings after normalization
 `selectMatchingOption()` normalizes punctuation before comparing (so "Bachelor's" and
 "Bachelors" match), but this broke technical terms like "C++", which normalizes down to just
 "c" — a single character that appears as a substring in almost any word, incorrectly winning
@@ -356,4 +492,17 @@ python app.py           # http://localhost:5000
   recognized** — the multi-frame detection (§6.6) waits for real fields to appear in whichever
   frame has them, but this was tuned against one specific Ashby wrapper page; a page with
   unusually slow third-party scripts could still exceed the poll window in rare cases.
+- **"Unknown" fields that are text-input-backed comboboxes** (Greenhouse/Ashby/Workday
+  dropdown-style questions rendered as a search input, not a native `<select>` or a visible
+  radio/checkbox group — e.g. Greenhouse's "Are you Hispanic/Latino?") don't get the choice-AI
+  treatment in §8.3, since their real options only exist once the widget is opened, which the
+  classification pass doesn't do. A version of this was built and tested (opening each such
+  field, reading its options, and sending them in a second batch call) but was reverted at the
+  user's request to keep the "one call per form" guarantee exact rather than "one or two calls
+  per form" — these fields fall back to plain manual review, same as before this AI work.
+- **Dashboard-dependent pieces of Point 2 (Legal Consent)** — a signup-time preference for
+  whether AI should analyze legal sections at all, and an explicit "exit automated flow, go
+  fully manual" option, both require the Tauzand user dashboard (Next.js), which is a separate,
+  not-yet-started phase. The AI analysis feature itself (§8.4) works today; what's missing is
+  the *opt-out* control layer around it.
 - **LinkedIn** — deliberately out of scope; see §3.
