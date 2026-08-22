@@ -165,6 +165,29 @@ function selectMatchingOption(optionPairs, targetValue, minRatio = 0.55) {
   return bestScore >= minRatio ? bestPair : null;
 }
 
+// Point 8: "Always check Others" — matches a standalone "Other"/"Others"
+// option (optionally followed by qualifiers like "(please specify)" or a
+// colon), but not compound words like "Another" or "otherwise" that
+// happen to start with the same letters.
+const OTHERS_OPTION_PATTERN = /^others?\b/i;
+function findOthersOption(optionPairs) {
+  return optionPairs.find((pair) => OTHERS_OPTION_PATTERN.test(pair.text.trim())) || null;
+}
+
+/**
+ * Same matching as selectMatchingOption(), but with one more step: if no
+ * exact or equivalent option is found, falls back to an "Others" option if
+ * the form provides one — rather than leaving a real, answerable question
+ * unfilled just because this specific form's fixed list doesn't include the
+ * candidate's actual value. The core bidirectional matching logic above is
+ * unchanged; this only adds a fallback on top of it.
+ */
+function selectMatchingOptionWithOthersFallback(optionPairs, targetValue, minRatio = 0.55) {
+  const directMatch = selectMatchingOption(optionPairs, targetValue, minRatio);
+  if (directMatch) return directMatch;
+  return findOthersOption(optionPairs);
+}
+
 function isLegalConsentGroup(questionTitle, optionTexts) {
   const haystack = [questionTitle, ...optionTexts].join(" ").toLowerCase();
   return LEGAL_CHECKBOX_KEYWORDS.some((keyword) => haystack.includes(keyword));

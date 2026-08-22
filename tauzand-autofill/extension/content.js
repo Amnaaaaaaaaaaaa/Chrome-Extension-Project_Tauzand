@@ -1003,9 +1003,20 @@ function addChoiceSuggestionButton(block, questionTitle) {
     e.preventDefault();
     e.stopPropagation();
     const optionPairs = (cached.optionElements || []).map((el) => ({ text: optionTextFor(el), element: el }));
-    const match = selectMatchingOption(optionPairs, cached.answer, 0.7);
-    if (match) {
-      clickOption(match.element);
+    // Multi-select answers come back as " | "-separated option texts (e.g.
+    // "Foundry | Gotham") — click each one that matches, rather than
+    // treating the whole combined string as a single option to find (which
+    // would never match, since no real option literally contains " | ").
+    const answerParts = cached.answer.split("|").map((part) => part.trim()).filter(Boolean);
+    let appliedCount = 0;
+    for (const part of answerParts) {
+      const match = selectMatchingOptionWithOthersFallback(optionPairs, part, 0.7);
+      if (match) {
+        clickOption(match.element);
+        appliedCount++;
+      }
+    }
+    if (appliedCount > 0) {
       btn.textContent = "\u2705 Applied";
       btn.disabled = true;
     } else {
@@ -1460,7 +1471,7 @@ async function fillChoiceFields(container, config, profile) {
       // ("None" matching "London" purely on generic character similarity,
       // no real semantic relation) get force-selected instead of correctly
       // falling back to manual review when no option genuinely fits.
-      const match = selectMatchingOption(optionPairs, profileValue, 0.65);
+      const match = selectMatchingOptionWithOthersFallback(optionPairs, profileValue, 0.65);
       if (match) {
         console.log(`[Tauzand Autofill] single-answer checkbox "${questionTitle}" — clicking "${match.text}" for value "${profileValue}"`);
         clickOption(match.element);
@@ -1472,7 +1483,7 @@ async function fillChoiceFields(container, config, profile) {
       }
     } else if (radioOptions.length) {
       const optionPairs = radioOptions.map((el) => ({ text: optionTextFor(el), element: el }));
-      const match = selectMatchingOption(optionPairs, profileValue);
+      const match = selectMatchingOptionWithOthersFallback(optionPairs, profileValue);
       if (match) {
         clickOption(match.element);
         filledCount++;
@@ -1483,7 +1494,7 @@ async function fillChoiceFields(container, config, profile) {
       if (dropdown.tagName === "SELECT") {
         const optionPairs = [...dropdown.options].map((opt) => ({ text: opt.textContent, element: opt }));
         console.log(`[Tauzand Autofill] native <select> "${questionTitle}" options:`, optionPairs.map((p) => p.text), "| target value:", profileValue);
-        const match = selectMatchingOption(optionPairs, profileValue);
+        const match = selectMatchingOptionWithOthersFallback(optionPairs, profileValue);
         console.log(`[Tauzand Autofill] native <select> best match:`, match ? match.text : "none found");
         if (match) {
           setSelectValue(dropdown, match.element.value);
@@ -1646,7 +1657,7 @@ async function fillChoiceFields(container, config, profile) {
             console.log(`[Tauzand Autofill] found ${optionElements.length} visible option(s):`, optionElements.map(optionTextFor));
 
             const optionPairs = optionElements.map((el) => ({ text: optionTextFor(el), element: el }));
-            const match = selectMatchingOption(optionPairs, cleanedValue);
+            const match = selectMatchingOptionWithOthersFallback(optionPairs, cleanedValue);
             console.log(`[Tauzand Autofill] best match for "${cleanedValue}":`, match ? match.text : "none found");
             if (match) {
               await trustedClick(match.element);
@@ -1795,7 +1806,7 @@ async function fillEducationSection(profile) {
     const options = await pollOptions();
     if (options.length === 0) return false;
     const pairs = options.map((el) => ({ text: optionTextFor(el), element: el }));
-    const match = selectMatchingOption(pairs, value);
+    const match = selectMatchingOptionWithOthersFallback(pairs, value);
     if (!match) return false;
     await trustedClick(match.element);
     return true;
@@ -2011,7 +2022,7 @@ function buildQuestionProcessingArray(container, config, profile) {
       const profileValue = resolveProfileValue(profile, matchedProfileKey);
       if (profileValue && typeof profileValue === "string" && !/[,;]/.test(profileValue)) {
         const optionPairs = optionTexts.map((text) => ({ text }));
-        const existingMatch = selectMatchingOption(optionPairs, profileValue);
+        const existingMatch = selectMatchingOptionWithOthersFallback(optionPairs, profileValue);
         if (!existingMatch) profileValueHint = profileValue; // plain text-matching found nothing — AI may still be able to
       }
     }
@@ -2165,6 +2176,7 @@ async function runAutofill(profileId) {
           choiceQuestions: unknownChoiceEntries.map((entry) => ({
             question: entry.question,
             options: entry.options,
+            fieldKind: entry.fieldKind,
             profileValueHint: entry.profileValueHint || null,
           })),
           legalItems: legalEntries.map((entry) => entry.question),

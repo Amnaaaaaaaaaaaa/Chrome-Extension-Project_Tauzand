@@ -237,16 +237,23 @@ def batch_generate_behavioral():
         "something fully generic. Keep each answer confident but honest, concise (3-5 "
         "sentences), and free of generic filler.\n\n"
         "2. CHOICE questions — each comes with a list of the ONLY valid options. Pick the "
-        "single option that best fits the candidate's background, and return its text EXACTLY "
-        "as given — do not paraphrase or invent a new option. Some CHOICE questions include a "
-        "\"Note\" giving the candidate's actual stored answer, which just doesn't textually "
-        "match any option (e.g. stored \"Female\", options are \"Man\"/\"Woman\"). Treat that as "
-        "a high-confidence translation, not a guess — pick the equivalent option confidently. "
-        "For everything else, do NOT guess at sensitive personal characteristics (age, "
-        "ethnicity, disability, veteran status, or similar) the candidate's profile has no "
-        "actual information about — if you cannot confidently determine the answer from their "
-        "real background, return an empty string for \"answer\" and set requires_review to "
-        "true.\n\n"
+        "option(s) that best fit the candidate's background, and return the text EXACTLY as "
+        "given — do not paraphrase, abbreviate, or invent an option that isn't in the list "
+        "(e.g. never answer \"No preference\", \"N/A\", or similar unless that exact text is "
+        "one of the given options). Some questions explicitly allow MULTIPLE selections (marked "
+        "\"multiple selections allowed\" below) — for those, and only those, you may return more "
+        "than one option, separated by \" | \" (e.g. \"Foundry | Gotham\"), with each part copied "
+        "exactly from the list. For single-selection questions, return exactly one option's "
+        "text, never more than one. Some CHOICE questions include a \"Note\" giving the "
+        "candidate's actual stored answer, which just doesn't textually match any option (e.g. "
+        "stored \"Female\", options are \"Man\"/\"Woman\"). Treat that as a high-confidence "
+        "translation, not a guess — pick the equivalent option confidently. For everything "
+        "else, do NOT guess at sensitive personal characteristics (age, ethnicity, disability, "
+        "veteran status, or similar) the candidate's profile has no actual information about — "
+        "if you cannot confidently determine the answer from their real background, or none of "
+        "the given options genuinely fit, return an empty string for \"answer\" and set "
+        "requires_review to true. An empty, honest answer is always better than inventing "
+        "something not in the list.\n\n"
         "3. LEGAL items — each is the full text of a legal/consent section from the form (e.g. "
         "a privacy-policy acknowledgment, an arbitration agreement, a data-processing consent). "
         "You are NOT deciding whether the candidate agrees — just explain what the section is "
@@ -280,6 +287,8 @@ def batch_generate_behavioral():
         for i, cq in enumerate(choice_questions):
             options_str = " | ".join(cq.get("options") or [])
             line = f"{i + 1}. {cq.get('question', '')}\n   Options: {options_str}"
+            if cq.get("fieldKind") == "checkbox":
+                line += "\n   (multiple selections allowed)"
             profile_value_hint = cq.get("profileValueHint")
             if profile_value_hint:
                 line += (
